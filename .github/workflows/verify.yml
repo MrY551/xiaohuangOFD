@@ -1,0 +1,88 @@
+name: verify
+
+# 三道门：署名在不在、结构合不合规、测试过不过。
+# fork 的人删了署名，这里会直接红。
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  authorship:
+    name: 署名与原创性
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 署名核验（14 项）
+        run: python3 tools/check_authorship.py
+
+      - name: BUILD_ID
+        run: python3 -m ofdlite.buildid
+
+      - name: 取证工具可用性（自身复制应判定为同源）
+        run: |
+          python3 tools/forensics.py --suspect . --sample 1 | tee /tmp/f.txt
+          grep -q "高度同源" /tmp/f.txt && echo "判定逻辑正常" || { echo "取证工具判定异常"; exit 1; }
+
+      - name: 许可文件完整性
+        run: |
+          set -e
+          for kw in "Copyright (c) 2026 小黄" "15359927763" "1924053793" \
+                    "违约与授权终止" "署名位置一览"; do
+            grep -q "$kw" LICENSE || { echo "LICENSE 缺少：$kw"; exit 1; }
+          done
+          echo "LICENSE 关键条款齐全"
+
+  tests:
+    name: 测试
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 依赖
+        run: |
+          python3 -m pip install --upgrade pip
+          pip install pillow lxml
+
+      - name: 核心库自测
+        run: python3 tools/selftest.py
+
+      - name: 网页端接口自测
+        run: python3 tools/web_test.py
+
+      - name: 生成测试样本
+        run: python3 tools/make_sample_ofd.py
+
+      - name: 标准结构校验
+        run: python3 tools/validate.py out/sample.ofd
+
+      - name: SHA256SUMS 与当前文件一致
+        run: |
+          python3 tools/gen_sha256sums.py
+          git diff --exit-code SHA256SUMS.txt || {
+            echo "SHA256SUMS.txt 未随代码更新，请跑 python3 tools/gen_sha256sums.py 并提交"
+            exit 1; }
+
+  standards:
+    name: 标准核对记录
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: 核对记录与 schema 是否齐全
+        run: |
+          set -e
+          test -f docs/标准核对记录.md || { echo "缺 docs/标准核对记录.md"; exit 1; }
+          n=$(ls docs/xsd/*.xsd 2>/dev/null | wc -l)
+          echo "schema 数量: $n"
+          test "$n" -ge 13 || { echo "schema 少于 13 个"; exit 1; }
+          test -f docs/专利点声明.md || { echo "缺 docs/专利点声明.md"; exit 1; }
+          test -f docs/法律核查.md || { echo "缺 docs/法律核查.md"; exit 1; }

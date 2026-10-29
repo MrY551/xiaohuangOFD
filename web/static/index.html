@@ -1,0 +1,188 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>小黄OFD · 网页端</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <span class="logo">黄</span>
+    <span class="brand-text">小黄OFD<em>·网页端</em></span>
+  </div>
+  <div class="fileinfo" id="fileinfo">未打开文档</div>
+  <div class="topactions">
+    <button id="btnOpen" class="primary">打开 OFD</button>
+    <button id="btnSave">保存</button>
+    <button id="btnSaveAs">另存为</button>
+  </div>
+</header>
+
+<div class="toolbar">
+  <div class="group">
+    <button id="btnUndo" title="撤销 Ctrl+Z">撤销</button>
+    <button id="btnRedo" title="重做 Ctrl+Y">重做</button>
+  </div>
+  <div class="group">
+    <button id="btnText" title="在页面空白处点一下放置文本">插入文字</button>
+    <button id="btnImage">插入图片</button>
+    <button id="btnRect">插入方框</button>
+  </div>
+  <div class="group">
+    <button id="btnDelete" title="删除选中 Delete">删除</button>
+    <button id="btnDup" title="复制选中">复制</button>
+  </div>
+  <div class="group">
+    <button id="btnFind">查找替换</button>
+  </div>
+  <div class="group">
+    <button id="btnPrint" class="primary">打印</button>
+    <button id="btnExport">导出</button>
+  </div>
+  <div class="group right">
+    <button id="btnZoomOut">−</button>
+    <span id="zoomLabel" class="zoom">100%</span>
+    <button id="btnZoomIn">＋</button>
+    <button id="btnFit">适应</button>
+    <label class="chk"><input type="checkbox" id="chkGrid"> 网格</label>
+  </div>
+</div>
+
+<main class="layout">
+  <aside class="thumbs" id="thumbs"></aside>
+  <section class="canvaswrap" id="canvaswrap">
+    <div class="emptystate" id="emptystate">
+      <p>还没有打开文档</p>
+      <p class="hint">点「打开 OFD」选一个文件，或把 .ofd 拖到这里</p>
+    </div>
+    <div class="canvas-host" id="canvasHost">
+      <canvas id="cv"></canvas>
+    </div>
+  </section>
+  <aside class="props" id="props">
+    <div class="props-title">属性</div>
+    <div id="propsBody" class="props-body">
+      <p class="muted">没有选中对象</p>
+    </div>
+    <div class="props-title">文档</div>
+    <div id="docBody" class="props-body"></div>
+  </aside>
+</main>
+
+<footer class="statusbar">
+  <span id="statusLeft">就绪</span>
+  <span id="author">小黄OFD · © 2026 小黄 &lt;15359927763&gt; QQ 1924053793</span>
+  <span id="statusRight"></span>
+</footer>
+
+<!-- 文本编辑 -->
+<div class="modal" id="dlgText" hidden>
+  <div class="modal-box">
+    <h3>编辑文字</h3>
+    <textarea id="textInput" rows="4"></textarea>
+    <div class="row">
+      <label>字号 mm <input type="number" id="textSize" step="0.5" min="0.5" max="200"></label>
+      <label>颜色 <input type="color" id="textColor" value="#000000"></label>
+      <label>加粗 <input type="checkbox" id="textBold"></label>
+    </div>
+    <div class="row">
+      <label>字体
+        <select id="textFont"><option value="">（保持）</option></select>
+      </label>
+    </div>
+    <div class="modal-actions">
+      <button class="ghost" data-close>取消</button>
+      <button id="textOk" class="primary">确定</button>
+    </div>
+  </div>
+</div>
+
+<!-- 查找替换 -->
+<div class="modal" id="dlgFind" hidden>
+  <div class="modal-box">
+    <h3>查找替换</h3>
+    <div class="row"><label>查找 <input type="text" id="findText" placeholder="要查找的文字"></label></div>
+    <div class="row"><label>替换为 <input type="text" id="replText" placeholder="新文字"></label></div>
+    <p class="muted" id="findResult"></p>
+    <div class="modal-actions">
+      <button class="ghost" data-close>关闭</button>
+      <button id="findOk" class="primary">全部替换</button>
+    </div>
+  </div>
+</div>
+
+<!-- 打印 -->
+<div class="modal" id="dlgPrint" hidden>
+  <div class="modal-box wide">
+    <h3>打印</h3>
+    <div class="grid2">
+      <label>打印机 <select id="printerSel"></select></label>
+      <label>纸张 <select id="paperSel">
+        <option>A4</option><option>A3</option><option>A5</option>
+        <option>B5</option><option>16K</option><option>Letter</option>
+      </select></label>
+      <label>页码范围 <input type="text" id="printPages" placeholder="如 1-3,5，留空=全部"></label>
+      <label>份数 <input type="number" id="printCopies" value="1" min="1" max="99"></label>
+      <label>每张页数 <select id="printNup">
+        <option value="1">1 合 1</option><option value="2">2 合 1</option>
+        <option value="4">4 合 1</option><option value="6">6 合 1</option>
+        <option value="9">9 合 1</option>
+      </select></label>
+      <label>双面 <input type="checkbox" id="printDuplex"></label>
+      <label>小册子（骑马钉） <input type="checkbox" id="printBooklet"></label>
+      <label>渲染 dpi <input type="number" id="printDpi" value="200" min="72" max="600" step="24"></label>
+    </div>
+    <p class="muted" id="printHint"></p>
+    <div class="modal-actions">
+      <button class="ghost" data-close>取消</button>
+      <button id="printPreview" class="ghost">先看预览</button>
+      <button id="printOk" class="primary">打印</button>
+    </div>
+  </div>
+</div>
+
+<!-- 导出 -->
+<div class="modal" id="dlgExport" hidden>
+  <div class="modal-box">
+    <h3>导出</h3>
+    <div class="grid2">
+      <label>格式 <select id="exportFmt">
+        <option value="pdf">PDF（全部页）</option>
+        <option value="png">PNG（当前页）</option>
+        <option value="svg">SVG（当前页，矢量）</option>
+        <option value="txt">纯文本</option>
+      </select></label>
+      <label>dpi <input type="number" id="exportDpi" value="200" min="72" max="600" step="24"></label>
+    </div>
+    <p class="muted">生成的文件会下载到浏览器默认目录。</p>
+    <div class="modal-actions">
+      <button class="ghost" data-close>取消</button>
+      <button id="exportOk" class="primary">导出</button>
+    </div>
+  </div>
+</div>
+
+<!-- 另存为 -->
+<div class="modal" id="dlgSaveAs" hidden>
+  <div class="modal-box">
+    <h3>另存为</h3>
+    <div class="row"><label>保存到（服务端路径）<input type="text" id="savePath"></label></div>
+    <p class="muted">填绝对路径，例如 /home/user/合同_修改版.ofd</p>
+    <div class="modal-actions">
+      <button class="ghost" data-close>取消</button>
+      <button id="saveAsOk" class="primary">保存</button>
+    </div>
+  </div>
+</div>
+
+<input type="file" id="fileInput" accept=".ofd,application/zip" hidden>
+<input type="file" id="imgInput" accept="image/*" hidden>
+<div class="toast" id="toast" hidden></div>
+
+<script src="/static/canvas.js"></script>
+<script src="/static/app.js"></script>
+</body>
+</html>

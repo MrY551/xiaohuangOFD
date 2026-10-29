@@ -1,0 +1,37 @@
+# 构建与运行产物
+out/
+dist/
+build/
+*.deb
+*.o
+*.ofdlite.tmp
+*.bak
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+
+# 标准原文与提取文本：属出版方版权，不入库，自行获取
+#   获取方式见 README「实现依据」
+docs/GBT_33190-2016.pdf
+docs/GBT_33190-2016.txt
+
+# 比对基准（第三方代码，只在本地跑原创性核查用）
+/tmp/orig_check/
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# 测试残留
+*.log
+*.pid
+.cdp-profile*/

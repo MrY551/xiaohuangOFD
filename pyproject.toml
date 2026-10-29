@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ofdlite"
+version = "1.0.0"
+description = "小黄OFD 核心库：OFD 版式文档解析、渲染与编辑（GB/T 33190-2016）"
+readme = "README.md"
+requires-python = ">=3.7"
+license = { text = "Xiaohuang-Software-Licence" }
+authors = [{ name = "小黄", email = "1924053793@qq.com" }]
+keywords = ["ofd", "document", "gb33190", "kylin", "版式文档"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: End Users/Desktop",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Topic :: Office/Business",
+    "Natural Language :: Chinese (Simplified)",
+]
+dependencies = ["Pillow>=9"]
+
+[project.optional-dependencies]
+qt = ["PySide6"]
+validate = ["lxml"]
+dev = ["lxml", "PySide6"]
+
+[project.urls]
+Homepage = "https://github.com/MrY551/xiaohuangOFD"
+Source = "https://github.com/MrY551/xiaohuangOFD"
+Issues = "https://github.com/MrY551/xiaohuangOFD/issues"
+
+[tool.setuptools]
+packages = ["ofdlite"]
