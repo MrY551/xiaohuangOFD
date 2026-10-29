@@ -32,7 +32,7 @@ ROOT = os.path.dirname(HERE)
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-from ofdlite import OFDPackage, convert, font_manager, model
+from ofdlite import OFDPackage, convert, extras, font_manager, model
 from ofdlite import geometry as geo
 from ofdlite.edits import Editor, EditError
 from ofdlite.errors import OfdError
@@ -81,6 +81,14 @@ class Session(object):
         return self.pkg
 
     # ---------------------------------------------------------- 描述
+    @staticmethod
+    def _outlines(pkg):
+        """7.8 大纲树。任何一步失败都退回空数组，不让它拖垮整页加载。"""
+        try:
+            return pkg.document.outlines()
+        except Exception:
+            return []
+
     def describe(self) -> dict:
         pkg = self.require()
         rep = convert.structure_report(pkg)
@@ -102,16 +110,53 @@ class Session(object):
         return {
             "path": pkg.path,
             "title": pkg.document.title,
+            # 7.8 大纲：解析成树给前端显示（有就显示，没有就空数组）
+            "outlines": self._outlines(pkg),
             "author": pkg.document.author,
             "pages": pages,
             "fonts": fonts,
             "entries": rep["entries"],
+            # ---- 7.5 / 16 / 17 / 18 / 19 / 20 章：以前只给大纲，现在全给前端
+            "doc_type": pkg.doc_type,
+            "ofd_version": pkg.ofd_version,
+            "permissions": pkg.document.permissions,
+            "vpreferences": pkg.document.vpreferences,
+            "bookmarks": pkg.document.bookmarks,
+            "attachments": pkg.document.attachments,
+            "custom_tags": pkg.document.custom_tags,
+            "extensions": pkg.document.extensions,
+            "signatures": pkg.document.signatures,
+            "versions": pkg.document.versions,
             "can_undo": self.editor.can_undo() if self.editor else False,
             "can_redo": self.editor.can_redo() if self.editor else False,
             "undo_label": self.editor.undo_label() if self.editor else "",
             "redo_label": self.editor.redo_label() if self.editor else "",
             "dirty": self.editor.dirty if self.editor else False,
         }
+
+    # ---------------------------------------------------------- 权限（表8）
+    def permissions(self) -> dict:
+        pkg = self.require()
+        return (pkg.document.permissions if pkg.documents else {}) or {}
+
+    def check_permission(self, key: str, what: str) -> None:
+        """表8：Edit/Export/Printable 这些声明不是建议，是文件自己的限制。"""
+        perm = self.permissions()
+        # 表8 ValidPeriod：过了允许访问的期限，同样要拦（只读浏览不受影响）
+        state = extras.validity_status(perm)
+        if state == "expired":
+            raise EditError("文档已过访问有效期（表8 ValidPeriod 结束日期已到），不能%s" % what)
+        if state == "not-started":
+            raise EditError("文档访问有效期尚未开始（表8 ValidPeriod 开始日期未到），不能%s" % what)
+        if perm.get(key, True) is False:
+            raise EditError("文档权限声明禁止%s（表8 %s=false）" % (what, key))
+
+    def find_attachment(self, att_id: str):
+        pkg = self.require()
+        for att in pkg.document.attachments:
+            if att["id"] == att_id:
+                return att
+        return None
 
     def scene(self, index: int, with_objects: bool = True) -> dict:
         pkg = self.require()
@@ -139,6 +184,9 @@ class Session(object):
             pkg = self.require()
             ed = self.editor
             op = req.get("op")
+            if op in ("save", "save_as"):
+                # 表8：Edit=false 的文件不许改（撤销/查看不受限制）
+                self.check_permission("Edit", "保存修改")
             pages = pkg.all_pages()
 
             def page_by(idx):
@@ -274,6 +322,7 @@ class Session(object):
     def export(self, req: dict) -> dict:
         with self.lock:
             pkg = self.require()
+            self.check_permission("Export", "导出")
             fmt = (req.get("format") or "pdf").lower()
             pages = req.get("pages")
             total = pkg.page_count()
@@ -301,7 +350,7 @@ class Session(object):
             if fmt in ("png", "jpeg", "jpg", "tiff"):
                 if len(idx) != 1:
                     raise EditError("位图一次导出一页，请指定单页")
-                from ofdlite.render_pil import render_page
+                from ofdlite.render_soft import render_page
                 img, warn = render_page(pkg.all_pages()[idx[0]], dpi=dpi)
                 ext = {"jpeg": "jpg", "jpg": "jpg"}.get(fmt, fmt)
                 path = os.path.join(outdir, "page_%d.%s" % (idx[0] + 1, ext))
@@ -317,6 +366,14 @@ class Session(object):
         with self.lock:
             from ofdlite import print_linux
             pkg = self.require()
+            self.check_permission("Printable", "打印")
+            # 表8：Copies 为 0 不许打印，为负或未设置＝份数不受限
+            copies_req = int(req.get("copies") or 1)
+            limit = extras.printable_count(self.permissions())
+            if limit == 0:
+                raise EditError("文档权限声明禁止打印（表8 Printable=false 或 Copies=0）")
+            if limit is not None and copies_req > limit:
+                raise EditError("文档权限声明限定最多打印 %d 份（表8 Copies）" % limit)
             pages = req.get("pages")
             total = pkg.page_count()
             idx = [int(i) for i in pages] if pages else list(range(total))
@@ -327,7 +384,7 @@ class Session(object):
                 pkg,
                 printer=req.get("printer") or print_linux.default_printer(),
                 pages=idx,
-                copies=int(req.get("copies") or 1),
+                copies=copies_req,
                 n_up=int(req.get("n_up") or 1),
                 paper=req.get("paper") or "A4",
                 duplex=bool(req.get("duplex")),
@@ -382,6 +439,9 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/download":
                 target = query.get("file", [""])[0]
                 return self._serve_generated(target)
+            if path.startswith("/api/attachment/"):
+                # 第20章：附件下载
+                return self._serve_attachment(path.split("/api/attachment/", 1)[1])
             return self._json({"ok": False, "error": "未知路径 %s" % path}, 404)
         except Exception as exc:
             return self._error(exc)
@@ -434,7 +494,7 @@ class Handler(BaseHTTPRequestHandler):
         }
 
     def _thumb(self, idx, dpi):
-        from ofdlite.render_pil import render_page
+        from ofdlite.render_soft import render_page
         with SESSION.lock:
             pkg = SESSION.require()
             pages = pkg.all_pages()
@@ -447,7 +507,7 @@ class Handler(BaseHTTPRequestHandler):
         return self._png(buf.getvalue())
 
     def _render(self, idx, dpi):
-        from ofdlite.render_pil import render_page
+        from ofdlite.render_soft import render_page
         with SESSION.lock:
             pkg = SESSION.require()
             pages = pkg.all_pages()
@@ -488,6 +548,30 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _serve_attachment(self, att_id: str):
+        """第20章：把附件内容按原名吐出来（只读包内字节，不落盘）。"""
+        with SESSION.lock:
+            att = SESSION.find_attachment(att_id)
+            if att is None:
+                return self._json({"ok": False, "error": "没有这个附件: %s" % att_id}, 404)
+            entry = att.get("entry") or ""
+            pkg = SESSION.require()
+            if not entry or not pkg.has(entry):
+                return self._json({"ok": False,
+                                   "error": "附件条目缺失: %s" % (entry or "(空)")}, 404)
+            data = pkg.read(entry)
+        name = att.get("name") or os.path.basename(entry) or ("attachment-%s" % att_id)
+        ctype = (mimetypes.guess_type(name)[0]
+                 or mimetypes.guess_type(entry)[0]
+                 or "application/octet-stream")
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Content-Disposition",
+                         'attachment; filename="%s"' % urllib.parse.quote(name))
         self.end_headers()
         self.wfile.write(data)
 

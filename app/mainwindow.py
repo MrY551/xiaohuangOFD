@@ -17,14 +17,16 @@ from .qt_renderer import (QT_API, QtSceneRenderer, qcolor, render_page_to_image)
 from PySide6.QtCore import QPointF, QRectF, QSize, Qt, QTimer
 from PySide6.QtGui import (QAction, QColor, QFont, QImage, QKeySequence, QPainter,
                            QPen, QPixmap, QPolygonF)
-from PySide6.QtWidgets import (QApplication, QCheckBox, QColorDialog, QComboBox,
-                               QDialog, QDialogButtonBox, QDockWidget,
-                               QDoubleSpinBox, QFileDialog, QFormLayout, QFrame,
-                               QHBoxLayout, QInputDialog, QLabel, QLineEdit,
-                               QListWidget, QListWidgetItem, QMainWindow,
-                               QMessageBox, QPushButton, QScrollArea, QSizePolicy,
-                               QSpinBox, QSplitter, QStatusBar, QToolBar,
-                               QVBoxLayout, QWidget)
+from PySide6.QtWidgets import (
+    QApplication, QCheckBox, QColorDialog, QComboBox,
+    QDialog, QDialogButtonBox, QDockWidget, QDoubleSpinBox,
+    QFileDialog, QFormLayout, QFrame, QHBoxLayout,
+    QInputDialog, QLabel, QLineEdit, QListWidget,
+    QListWidgetItem, QMainWindow, QMessageBox, QPushButton,
+    QScrollArea, QSizePolicy, QSpinBox, QSplitter,
+    QStatusBar, QToolBar, QTreeWidget, QTreeWidgetItem,
+    QVBoxLayout, QWidget,
+)
 
 from ofdlite import OFDPackage, build_page_scene, model
 from ofdlite import geometry as geo
@@ -511,7 +513,15 @@ class MainWindow(QMainWindow):
         th = QWidget()
         thl = QVBoxLayout(th)
         thl.setContentsMargins(0, 0, 0, 0)
-        thl.addWidget(self.thumbs)
+        thl.addWidget(self.thumbs, 3)
+        # 7.8 大纲：页面缩略图下方挂一个树，点击跳页
+        self.outline = QTreeWidget()
+        self.outline.setHeaderHidden(True)
+        self.outline.setIndentation(12)
+        self.outline.setMaximumHeight(220)
+        self.outline.itemClicked.connect(self._outline_clicked)
+        self.outline.hide()
+        thl.addWidget(self.outline, 2)
         split.addWidget(th)
         split.addWidget(self.scroll)
         split.addWidget(self.props)
@@ -530,6 +540,46 @@ class MainWindow(QMainWindow):
         self._thumb_timer = QTimer(self)
         self._thumb_timer.setSingleShot(True)
         self._thumb_timer.timeout.connect(self._build_thumbs)
+
+    # ---------------------------------------------------------- 大纲（7.8）
+    def _fill_outline(self) -> None:
+        """把文档大纲填进树。没有大纲就整块隐藏。"""
+        self.outline.clear()
+        pkg = getattr(self, "pkg", None)
+        if pkg is None:
+            self.outline.hide()
+            return
+        try:
+            tree = pkg.document.outlines()
+        except Exception:
+            tree = []
+        if not tree:
+            self.outline.hide()
+            return
+        pages = pkg.all_pages()
+        id2idx = {str(p.id): i for i, p in enumerate(pages)}
+
+        def add(parent, nodes):
+            for n in nodes:
+                it = QTreeWidgetItem([n.get("title") or "(无标题)"])
+                act = next((a for a in n.get("actions") or [] if a.get("kind") == "goto"), None)
+                if act and act.get("dest") in id2idx:
+                    it.setData(0, Qt.UserRole, id2idx[act["dest"]])
+                if parent is None:
+                    self.outline.addTopLevelItem(it)
+                else:
+                    parent.addChild(it)
+                if n.get("children"):
+                    add(it, n["children"])
+
+        add(None, tree)
+        self.outline.expandAll()
+        self.outline.show()
+
+    def _outline_clicked(self, item, _col) -> None:
+        idx = item.data(0, Qt.UserRole)
+        if idx is not None:
+            self.goto_page(int(idx))
 
     # ---------------------------------------------------------- UI 构建
     def _build_actions(self):
@@ -662,9 +712,13 @@ class MainWindow(QMainWindow):
                                 "h": p.size().h}
                                for i, p in enumerate(pkg.all_pages())])
         self.goto_page(0)
+        self._fill_outline()          # 大纲立即填充，不等缩略图的定时器
         self._thumb_timer.start(120)
         self.setWindowTitle("%s — %s" % (os.path.basename(path), APP_TITLE))
         self._status("已打开 %s（%d 页）" % (path, pkg.page_count()))
+        # 视图首选项 / 权限 / 签名摘要（第 7.5 与 18 章）
+        self._apply_extras(pkg)
+        self._update_actions()
 
     def save_file(self):
         if not self.pkg:
@@ -1021,6 +1075,10 @@ class MainWindow(QMainWindow):
     def export(self, fmt: str):
         if not self.pkg:
             return
+        if self._permissions().get("Export") is False:
+            QMessageBox.warning(self, "不能导出",
+                                "文档权限声明禁止导出（表8 Export=false）。")
+            return
         from ofdlite import convert
         if fmt == "pdf":
             path, _ = QFileDialog.getSaveFileName(
@@ -1064,8 +1122,16 @@ class MainWindow(QMainWindow):
     def do_print(self):
         if not self.pkg:
             return
+        from ofdlite import extras as _extras
+        perm = self._permissions()
+        limit = _extras.printable_count(perm)
+        if limit == 0:
+            QMessageBox.warning(self, "不能打印",
+                                "文档权限声明禁止打印（表8 Printable=false 或 Copies=0）。")
+            return
         from .print_dialog import PrintDialog
-        dlg = PrintDialog(self.pkg, self.page_index, self)
+        dlg = PrintDialog(self.pkg, self.page_index, self,
+                          copies_limit=limit)
         dlg.exec()
 
     # ---------------------------------------------------------- 杂项
@@ -1105,11 +1171,64 @@ class MainWindow(QMainWindow):
                   self.act_print, self.act_text, self.act_image, self.act_rect,
                   self.act_find, self.act_rot_page, self.act_add_page, self.act_del_page):
             a.setEnabled(has_doc)
+        # 表8 权限声明：文件自己说不许做什么，菜单项就置灰并写清原因
+        perm = self._permissions()
+        if has_doc:
+            from ofdlite import extras as _ex
+            period = _ex.validity_status(perm)
+            if period in ("expired", "not-started"):
+                msg = ("文档已过访问有效期（表8 ValidPeriod）" if period == "expired"
+                       else "文档访问有效期尚未开始（表8 ValidPeriod）")
+                for a in (self.act_save, self.act_save_as, self.act_export_pdf,
+                          self.act_export_png, self.act_export_svg,
+                          self.act_export_txt, self.act_print):
+                    a.setEnabled(False)
+                    a.setToolTip(msg)
+        if has_doc and perm.get("Edit") is False:
+            for a in (self.act_save, self.act_save_as):
+                a.setEnabled(False)
+                a.setToolTip("文档权限声明禁止编辑（表8 Edit=false）")
+        if has_doc and perm.get("Export") is False:
+            for a in (self.act_export_pdf, self.act_export_png,
+                      self.act_export_svg, self.act_export_txt):
+                a.setEnabled(False)
+                a.setToolTip("文档权限声明禁止导出（表8 Export=false）")
+        if has_doc and perm.get("Printable") is False:
+            self.act_print.setEnabled(False)
+            self.act_print.setToolTip("文档权限声明禁止打印（表8 Printable=false）")
         self.act_undo.setEnabled(has_doc and self.editor.can_undo())
         self.act_redo.setEnabled(has_doc and self.editor.can_redo())
         sel = bool(self.canvas.selection)
         self.act_delete.setEnabled(has_doc and sel)
         self.act_dup.setEnabled(has_doc and sel)
+
+    def _permissions(self) -> dict:
+        if not self.pkg or not self.pkg.documents:
+            return {}
+        return self.pkg.document.permissions or {}
+
+    def _apply_extras(self, pkg) -> None:
+        """把第 7.5 / 18 章的东西落到界面上：视图首选项、权限、签名、DocType。"""
+        doc = pkg.document
+        pref = doc.vpreferences or {}
+        if pref.get("HideToolbar"):
+            for tb in self.findChildren(QToolBar):
+                tb.setVisible(False)
+        if pref.get("HideMenubar"):
+            self.menuBar().setVisible(False)
+        if pref.get("Zoom"):
+            try:
+                self.set_zoom(float(pref["Zoom"]) / 100.0)
+            except Exception:
+                pass
+        sig = (doc.signatures or {}).get("items") or []
+        bits = ["DocType=%s" % (pkg.doc_type or "-")]
+        bits.append("签名 %d 个" % len(sig) if sig else "无签名")
+        if (doc.permissions or {}).get("Export") is False:
+            bits.append("禁导出")
+        if (doc.permissions or {}).get("Printable") is False:
+            bits.append("禁打印")
+        self._status(" · ".join(bits))
 
     def _status(self, text: str):
         self.statusBar().showMessage(text)

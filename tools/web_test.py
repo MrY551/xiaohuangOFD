@@ -330,6 +330,54 @@ def main(argv=None):
             return
         raise AssertionError("应该被拒")
 
+    # ---- 第 7.5 / 16 / 17 / 18 / 19 / 20 章：附属结构 + 权限生效
+    extras_path = os.path.join(ROOT, "out", "extras_test.ofd")
+    if not os.path.exists(extras_path):
+        import make_extras_ofd
+        os.makedirs(os.path.dirname(extras_path), exist_ok=True)
+        make_extras_ofd.build(extras_path)
+
+    @check("打开附属结构样本：meta 里带齐权限/书签/附件/签名/版本")
+    def _():
+        r = c.post("/api/open", {"path": extras_path})
+        if not r.get("ok"):
+            raise AssertionError(r)
+        doc = r["doc"]
+        if doc.get("permissions", {}).get("Export") is not False:
+            raise AssertionError(doc.get("permissions"))
+        if doc.get("permissions", {}).get("Copies") != 2:
+            raise AssertionError(doc.get("permissions"))
+        if len(doc.get("bookmarks") or []) != 2:
+            raise AssertionError(doc.get("bookmarks"))
+        if len(doc.get("attachments") or []) != 2:
+            raise AssertionError(doc.get("attachments"))
+        if not (doc.get("signatures") or {}).get("items"):
+            raise AssertionError(doc.get("signatures"))
+        if len((doc.get("versions") or {}).get("items") or []) != 2:
+            raise AssertionError(doc.get("versions"))
+        if not doc.get("custom_tags") or not doc.get("extensions"):
+            raise AssertionError((doc.get("custom_tags"), doc.get("extensions")))
+        if (doc.get("vpreferences") or {}).get("Zoom") != 120:
+            raise AssertionError(doc.get("vpreferences"))
+
+    @check("表8：Export=false 时导出被拒")
+    def _():
+        r = c.post("/api/export", {"format": "pdf", "pages": [0]})
+        if r.get("ok") is not False or "Export" not in str(r.get("error")):
+            raise AssertionError(r)
+
+    @check("表8：Printable=false 时打印被拒")
+    def _():
+        r = c.post("/api/print", {"pages": [0]})
+        if r.get("ok") is not False or "打印" not in str(r.get("error")):
+            raise AssertionError(r)
+
+    @check("第20章：附件可按 ID 取回内容")
+    def _():
+        data = c.get("/api/attachment/A1")
+        if "A1" not in data.decode("utf-8", "replace") and len(data) < 4:
+            raise AssertionError(data[:40])
+
     if not args.keep:
         proc.terminate()
         try:

@@ -170,9 +170,19 @@ def cjk_font() -> Optional[str]:
     return files[0] if files else None
 
 
+MONO_SUBSTITUTES = [
+    "Liberation Mono", "DejaVu Sans Mono", "Nimbus Mono PS", "Courier New",
+    "Consolas", "Noto Sans Mono CJK SC", "WenQuanYi Zen Hei Mono",
+]
+
+
 def resolve(family: str, bold: bool = False, italic: bool = False,
-            embedded: Optional[str] = None) -> Optional[str]:
-    """按 OFD 里的字体名选一个本机字体文件。embedded 是包内嵌入字体路径。"""
+            embedded: Optional[str] = None, mono: bool = False) -> Optional[str]:
+    """按 OFD 里的字体名选一个本机字体文件。embedded 是包内嵌入字体路径。
+
+    mono 来自表44 的 FixedWidth，标准原文是"用于匹配替代字型"：
+    原名能找到就照用，找不到才优先等宽字体。它不改变排版步进。
+    """
     if embedded and os.path.exists(embedded):
         return embedded
     index = scan()
@@ -201,6 +211,13 @@ def resolve(family: str, bold: bool = False, italic: bool = False,
         for name, paths in index.items():
             if key in name or name in key:
                 candidates.extend(paths)
+                break
+    # 4.5 表44 FixedWidth：替代时优先等宽字型
+    if not candidates and mono:
+        for name in MONO_SUBSTITUTES:
+            k = _norm(name)
+            if k in index and index[k]:
+                candidates.extend(index[k])
                 break
     # 5. 中文兜底
     if not candidates:

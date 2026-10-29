@@ -23,8 +23,10 @@ DECL = '<?xml version="1.0" encoding="UTF-8"?>\n'
 
 
 def ofd_xml(title):
+    # 表3：Version 取值固定 "1.0"；DocType=OFD。探针也要先合规，
+    # 否则验出来的问题分不清是"实现对"还是"样本本身不合规"。
     return DECL + (
-        '<ofd:OFD xmlns:ofd="%s" DocType="OFD" Version="1.1">\n'
+        '<ofd:OFD xmlns:ofd="%s" DocType="OFD" Version="1.0">\n'
         '  <ofd:DocBody>\n'
         '    <ofd:DocInfo><ofd:DocID>PROBE-1</ofd:DocID>'
         '<ofd:Title>%s</ofd:Title></ofd:DocInfo>\n'
@@ -147,6 +149,128 @@ def public_res():
     ) % NS
 
 
+def build_color_sample(out_dir):
+    """8.3.1 / 8.3.2 / 表25 / 表26 / 表27：颜色的四种写法 + 调色板 + BPC。
+
+    五个色块从左到右，标准期望值写进 print，肉眼看渲染图即可核对：
+      1  "#11 #22 #33"           表27 的逐通道十六进制 RGB -> (17,34,51) 深蓝黑
+      2  "#FF"  + ColorSpace=3   表27 的 GRAY 写法 -> 白
+      3  "15 0 0" + BPC=4        表27 的通道上限 2^4-1 -> 纯红
+      4  Index=1 调色板           表26 的 Index 取色 -> 纯蓝
+      5  "0 255 255 0" + CS=5    资源里 CS5 是 CMYK -> 纯红（BPC=8 时 255 才是满墨）
+    """
+    os.makedirs(out_dir, exist_ok=True)
+    path = os.path.join(out_dir, "probe_color.ofd")
+    boxes = [
+        (10, 20, 30, 30, '<ofd:FillColor Value="#11 #22 #33" ColorSpace="1"/>'),
+        (50, 20, 30, 30, '<ofd:FillColor Value="#FF" ColorSpace="3"/>'),
+        (90, 20, 30, 30, '<ofd:FillColor Value="15 0 0" ColorSpace="4"/>'),
+        (130, 20, 30, 30, '<ofd:FillColor Index="1" ColorSpace="2"/>'),
+        (10, 60, 30, 30, '<ofd:FillColor Value="0 255 255 0" ColorSpace="5"/>'),
+    ]
+    objs = []
+    for i, (x, y, w, h, fill) in enumerate(boxes):
+        objs.append(
+            '<ofd:PathObject ID="%d" Boundary="%d %d %d %d" Fill="true" Stroke="false">'
+            '%s<ofd:AbbreviatedData>M 0 0 L %d 0 L %d %d L 0 %d C</ofd:AbbreviatedData>'
+            '</ofd:PathObject>' % (200 + i, x, y, w, h, fill, w, w, h, h))
+    page = DECL + (
+        '<ofd:Page xmlns:ofd="%s">'
+        '<ofd:Area><ofd:PhysicalBox>0 0 180 110</ofd:PhysicalBox></ofd:Area>'
+        '<ofd:Content><ofd:Layer ID="210">%s</ofd:Layer></ofd:Content></ofd:Page>'
+        % (NS, "".join(objs)))
+    res = DECL + (
+        '<ofd:Res xmlns:ofd="%s" BaseLoc="Res">'
+        '<ofd:ColorSpaces>'
+        '<ofd:ColorSpace ID="1" Type="RGB" BitsPerComponent="8"/>'
+        '<ofd:ColorSpace ID="2" Type="RGB" BitsPerComponent="8">'
+        '<ofd:Palette>'
+        '<ofd:CV>255 0 0</ofd:CV>'
+        '<ofd:CV>0 0 255</ofd:CV>'
+        '</ofd:Palette></ofd:ColorSpace>'
+        '<ofd:ColorSpace ID="3" Type="GRAY" BitsPerComponent="8"/>'
+        '<ofd:ColorSpace ID="4" Type="RGB" BitsPerComponent="4"/>'
+        '<ofd:ColorSpace ID="5" Type="CMYK" BitsPerComponent="8"/>'
+        '</ofd:ColorSpaces></ofd:Res>' % NS)
+    z = zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED)
+    z.writestr("OFD.xml", ofd_xml("颜色写法探针"))
+    z.writestr("Doc_0/Document.xml", document_xml(False))
+    z.writestr("Doc_0/PublicRes.xml", res)
+    z.writestr("Doc_0/Pages/Page_0/Content.xml", page)
+    z.close()
+    return path
+
+
+def build_drawparam_sample(out_dir):
+    """表21：DrawParam 可以用 Relative 继承基础绘制参数。
+
+    DP10 = 红笔 + 线宽 1.0；DP20 Relative="10"，只改 Join。
+    引用 DP20 的对象应当拿到「红色 + 1.0mm + 圆角」三样。
+    """
+    os.makedirs(out_dir, exist_ok=True)
+    path = os.path.join(out_dir, "probe_drawparam.ofd")
+    page = DECL + (
+        '<ofd:Page xmlns:ofd="%s">'
+        '<ofd:Area><ofd:PhysicalBox>0 0 120 60</ofd:PhysicalBox></ofd:Area>'
+        '<ofd:Content><ofd:Layer ID="310">'
+        '<ofd:PathObject ID="311" Boundary="10 10 100 40" DrawParam="20" Fill="false">'
+        '<ofd:AbbreviatedData>M 0 0 L 100 0 L 100 40 C</ofd:AbbreviatedData>'
+        '</ofd:PathObject>'
+        '</ofd:Layer></ofd:Content></ofd:Page>' % NS)
+    res = DECL + (
+        '<ofd:Res xmlns:ofd="%s" BaseLoc="Res">'
+        '<ofd:ColorSpaces><ofd:ColorSpace ID="1" Type="RGB" BitsPerComponent="8"/>'
+        '</ofd:ColorSpaces>'
+        '<ofd:DrawParams>'
+        '<ofd:DrawParam ID="10" LineWidth="1.0" Join="Miter" Cap="Butt">'
+        '<ofd:StrokeColor Value="255 0 0" ColorSpace="1"/></ofd:DrawParam>'
+        '<ofd:DrawParam ID="20" Relative="10" Join="Round"/>'
+        '</ofd:DrawParams></ofd:Res>' % NS)
+    z = zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED)
+    z.writestr("OFD.xml", ofd_xml("绘制参数继承探针"))
+    z.writestr("Doc_0/Document.xml", document_xml(False))
+    z.writestr("Doc_0/PublicRes.xml", res)
+    z.writestr("Doc_0/Pages/Page_0/Content.xml", page)
+    z.close()
+    return path
+
+
+def build_composite_sample(out_dir):
+    """第 13 章：矢量图像资源的元素名按标准写 CompositeGraphicUnit。
+
+    早期实现查的是 CompositeGraphUnit（少个 ic），标准件一个都读不到，
+    复合对象渲染成空白；这个样本就是那条的回归用例。
+    """
+    os.makedirs(out_dir, exist_ok=True)
+    path = os.path.join(out_dir, "probe_composite.ofd")
+    vg = ('<ofd:PathObject ID="60" Boundary="0 0 20 20" Fill="true" Stroke="false">'
+          '<ofd:FillColor Value="0 200 0" ColorSpace="1"/>'
+          '<ofd:AbbreviatedData>M 0 0 L 20 0 L 20 20 L 0 20 C</ofd:AbbreviatedData>'
+          '</ofd:PathObject>')
+    res = DECL + (
+        '<ofd:Res xmlns:ofd="%s" BaseLoc="Res">'
+        '<ofd:ColorSpaces><ofd:ColorSpace ID="1" Type="RGB" BitsPerComponent="8"/>'
+        '</ofd:ColorSpaces>'
+        '<ofd:CompositeGraphicUnits>'
+        '<ofd:CompositeGraphicUnit ID="70" Width="20" Height="20">'
+        '<ofd:Content>%s</ofd:Content>'
+        '</ofd:CompositeGraphicUnit>'
+        '</ofd:CompositeGraphicUnits></ofd:Res>' % (NS, vg))
+    page = DECL + (
+        '<ofd:Page xmlns:ofd="%s">'
+        '<ofd:Area><ofd:PhysicalBox>0 0 100 80</ofd:PhysicalBox></ofd:Area>'
+        '<ofd:Content><ofd:Layer ID="20">'
+        '<ofd:CompositeObject ID="21" ResourceID="70" Boundary="30 30 20 20"/>'
+        '</ofd:Layer></ofd:Content></ofd:Page>' % NS)
+    z = zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED)
+    z.writestr("OFD.xml", ofd_xml("复合对象探针"))
+    z.writestr("Doc_0/Document.xml", document_xml(False))
+    z.writestr("Doc_0/PublicRes.xml", res)
+    z.writestr("Doc_0/Pages/Page_0/Content.xml", page)
+    z.close()
+    return path
+
+
 def build(out_dir):
     os.makedirs(out_dir, exist_ok=True)
     made = []
@@ -247,12 +371,38 @@ def build_annot_sample(out_dir):
     z.close()
     return path
 
+def _probe_object_detail(o):
+    """把对象解析出来的颜色/描边/子对象打出来。
+
+    只看"渲染了没有"抓不到"颜色算错了"——颜色空间、BPC、调色板、
+    绘制参数继承这几类错误，画面都是"有东西"，只是颜色/线宽不对。
+    """
+    out = []
+    try:
+        if o.has_stroke():
+            out.append("stroke: color=%s width=%.3f join=%s cap=%s"
+                       % (o.stroke_color(), o.line_width(),
+                          o.line_join(), o.line_cap()))
+        if o.has_fill():
+            out.append("fill:   color=%s" % (o.fill_color(),))
+        kids = o.children()
+    except Exception:
+        kids = []
+    if kids:
+        out.append("子对象 %d：%s" % (len(kids),
+                                     [(k.id, k.fill_color()) for k in kids]))
+    return out
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("-o", "--out", default=os.path.join(ROOT, "out", "probe"))
     args = ap.parse_args(argv)
     paths = build(args.out)
     paths.append(build_annot_sample(args.out))
+    for maker in (build_color_sample, build_drawparam_sample,
+                  build_composite_sample):
+        paths.append(maker(args.out))
     from ofdlite import OFDPackage
     from ofdlite.render_pil import render_page
     from ofdlite.scene import build_page_scene
@@ -267,6 +417,8 @@ def main(argv=None):
             print("    注释:", anno.describe(), "参数:", anno.parameters)
         for o in page.objects():
             print("    -", o.describe())
+            for line in _probe_object_detail(o):
+                print("       ", line)
         sc = build_page_scene(page)
         print("  指令数:", len(sc.ops), " 告警:", sc.warnings or "无")
         img, warn = render_page(page, dpi=100)

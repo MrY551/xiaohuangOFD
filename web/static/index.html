@@ -48,6 +48,7 @@
     <button id="btnZoomIn">＋</button>
     <button id="btnFit">适应</button>
     <label class="chk"><input type="checkbox" id="chkGrid"> 网格</label>
+    <label class="chk"><input type="checkbox" id="chkActions" checked> 动作热区</label>
   </div>
 </div>
 
@@ -67,6 +68,12 @@
     <div id="propsBody" class="props-body">
       <p class="muted">没有选中对象</p>
     </div>
+    <div class="props-title" id="outlineTitle" hidden>大纲</div>
+    <div id="outlineBody" class="props-body outline-body" hidden></div>
+    <div class="props-title" id="bookmarkTitle" hidden>书签</div>
+    <div id="bookmarkBody" class="props-body outline-body" hidden></div>
+    <div class="props-title" id="attachTitle" hidden>附件</div>
+    <div id="attachBody" class="props-body outline-body" hidden></div>
     <div class="props-title">文档</div>
     <div id="docBody" class="props-body"></div>
   </aside>

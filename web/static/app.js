@@ -108,6 +108,7 @@ async function boot() {
       state.doc = d.doc;
       await renderThumbs();
       await loadPage(0);
+      applyVPreferences(d.doc);
       updateFileInfo();
     }
   } catch (e) { /* 没有打开文档属正常 */ }
@@ -126,6 +127,7 @@ async function openLocalFile(file) {
     state.selection = [];
     await renderThumbs();
     await loadPage(0);
+    applyVPreferences(d.doc);
     toast('已打开 ' + file.name);
   } catch (e) {
     toast('打开失败：' + e.message, true);
@@ -157,11 +159,307 @@ async function loadPage(index) {
   fitZoom();
   updateFileInfo();
   updateToolbar();
+  renderOutlines(state.doc);
+  renderBookmarks(state.doc);
+  renderAttachments(state.doc);
+}
+
+/* ---------------------------------------------------------------- 动作热区 */
+
+// 14 章：带 Actions 的图元要能点。这里在画布上叠一层细虚线框标出来，
+// 点击时按 action.kind 分派：goto 跳页、uri 交给浏览器（新窗口）。
+function collectActionRegions(scene) {
+  const out = [];
+  if (!scene || !scene.ops) return out;
+  for (const op of scene.ops) {
+    const acts = op.actions;
+    if (!acts || !acts.length) continue;
+    let x, y, w, h;
+    if (op.corners && op.corners.length >= 2) {
+      const xs = op.corners.map((c) => c[0]);
+      const ys = op.corners.map((c) => c[1]);
+      x = Math.min(...xs); y = Math.min(...ys);
+      w = Math.max(...xs) - x; h = Math.max(...ys) - y;
+    } else if (typeof op.x === 'number' && typeof op.w === 'number') {
+      x = op.x; y = op.y; w = op.w; h = op.h;
+    } else if (op.subs && op.subs.length) {
+      // path 类型没有 x/w/h，要从子路径点集算包围盒
+      let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+      for (const a of op.subs) {
+        for (let k = 0; k + 1 < a.length; k += 2) {
+          if (a[k] < x0) x0 = a[k];
+          if (a[k] > x1) x1 = a[k];
+          if (a[k + 1] < y0) y0 = a[k + 1];
+          if (a[k + 1] > y1) y1 = a[k + 1];
+        }
+      }
+      if (!isFinite(x0)) continue;
+      x = x0; y = y0; w = x1 - x0; h = y1 - y0;
+    } else {
+      continue;
+    }
+    out.push({ x, y, w, h, actions: acts });
+  }
+  return out;
+}
+
+function drawActionRegions(ctx, regions, scale) {
+  if (!regions.length) return;
+  ctx.save();
+  ctx.setLineDash([3, 3]);
+  ctx.lineWidth = 1;
+  ctx.strokeStyle = 'rgba(22,104,220,0.75)';
+  for (const r of regions) {
+    ctx.strokeRect(r.x * scale, r.y * scale, r.w * scale, r.h * scale);
+  }
+  ctx.restore();
+}
+
+// 点画布时先查热区，命中就执行动作；否则走原来的选中逻辑
+function hitActionRegion(regions, xmm, ymm) {
+  for (let i = regions.length - 1; i >= 0; i--) {
+    const r = regions[i];
+    if (xmm >= r.x && xmm <= r.x + r.w && ymm >= r.y && ymm <= r.y + r.h) return r;
+  }
+  return null;
+}
+
+// 表54 的 Dest 落地：XYZ 用缩放+定位，Fit/FitH/FitV/FitR 用对应的适配
+function applyDest(detail) {
+  if (!detail) return;
+  const t = (detail.type || 'XYZ').toUpperCase();
+  if (t === 'FITH') { fitWidthOnly(); }
+  else if (t === 'FITV') { fitHeightOnly(); }
+  else if (t === 'FITR') { fitRectOnly(detail.left, detail.top, detail.right, detail.bottom); }
+  else if (t === 'FIT') { fitZoom(); }
+  else {
+    if (detail.zoom) setZoom(detail.zoom / 100);
+  }
+  if (t === 'XYZ' || t === 'FITH' || t === 'FITR') {
+    scrollToMm(detail.left || 0, detail.top || 0);
+  }
+}
+
+// 滚到页内某点（Left/Top 是目标区域左上角，单位 mm）
+function scrollToMm(xmm, ymm) {
+  const wrap = $('canvaswrap');
+  const host = $('canvasHost');
+  if (!wrap || !host) return;
+  const Z = BASE_PX_PER_MM * state.zoom;
+  const left = Math.max(0, xmm * Z - wrap.clientWidth / 3);
+  const top = Math.max(0, ymm * Z - wrap.clientHeight / 3);
+  if (host.offsetParent === wrap) {
+    wrap.scrollLeft = left;
+    wrap.scrollTop = top;
+  }
+}
+
+function runActions(region) {
+  for (const a of region.actions) {
+    if (a.kind === 'goto') {
+      const idx = pageIndexOfDest(state.doc, a.dest);
+      if (idx >= 0) {
+        loadPage(idx).then(() => applyDest(a.dest_detail));
+        return true;
+      }
+    } else if (a.kind === 'uri' && a.uri) {
+      const url = (a.base || '') + a.uri;
+      // 附录 A 的 URI 动作可带 Target（目标窗口名）
+      window.open(url, a.target || '_blank', 'noopener');
+      return true;
+    } else if (a.kind === 'gotoa' && a.attach_id) {
+      // 表55：打开本文档内的附件
+      window.open('/api/attachment/' + encodeURIComponent(a.attach_id),
+        a.new_window === false ? '_self' : '_blank');
+      return true;
+    } else if (a.kind === 'sound' || a.kind === 'movie') {
+      toast('该动作是' + (a.kind === 'sound' ? '音频' : '视频') +
+        '播放（第14章），本工具不放音视频；资源 ID ' + (a.resource_id || '—'));
+      return true;
+    }
+  }
+  return false;
+}
+
+/* ---------------------------------------------------------------- 大纲 */
+
+// 7.8 大纲：把树渲染成可点击的层级列表。
+// 只处理 goto（跳页）动作；URI 动作显示成外链样式但不在此处跳转。
+function pageIndexOfDest(doc, pageId) {
+  if (!doc || !pageId) return -1;
+  const pages = doc.pages || [];
+  for (let i = 0; i < pages.length; i++) {
+    if (String(pages[i].id) === String(pageId)) return i;
+  }
+  return -1;
+}
+
+function renderOutlines(doc) {
+  const body = $('outlineBody');
+  const title = $('outlineTitle');
+  if (!body || !title) return;
+  const tree = (doc && doc.outlines) || [];
+  if (!tree.length) {
+    title.hidden = true;
+    body.hidden = true;
+    body.innerHTML = '';
+    return;
+  }
+  title.hidden = false;
+  body.hidden = false;
+  body.innerHTML = '';
+  const walk = (nodes, depth) => {
+    for (const n of nodes) {
+      const row = document.createElement('div');
+      row.className = 'outline-row';
+      row.style.paddingLeft = (6 + depth * 13) + 'px';
+      row.textContent = n.title || '(无标题)';
+      const act = (n.actions || []).find((a) => a.kind === 'goto');
+      if (act) {
+        const idx = pageIndexOfDest(doc, act.dest);
+        if (idx >= 0) {
+          row.classList.add('clickable');
+          row.title = '跳到第 ' + (idx + 1) + ' 页';
+          row.addEventListener('click', () => loadPage(idx));
+        }
+      }
+      body.appendChild(row);
+      if (n.children && n.children.length) walk(n.children, depth + 1);
+    }
+  };
+  walk(tree, 0);
 }
 
 async function safeDoc() {
   try { await refreshDoc(); return !!(state.doc && state.doc.pages.length); }
   catch (e) { return false; }
+}
+
+/* -------------------------------------------------- 表10 书签 / 表72 附件 */
+
+// 表10：Bookmarks/Bookmark[@Name] + Dest（表54）。dest.page_id 是页面标识，
+// 要换算成页序号才能跳；Zoom 有值就顺手设缩放。
+function renderBookmarks(doc) {
+  const body = $('bookmarkBody');
+  const title = $('bookmarkTitle');
+  if (!body || !title) return;
+  const list = (doc && doc.bookmarks) || [];
+  if (!list.length) {
+    title.hidden = true; body.hidden = true; body.innerHTML = '';
+    return;
+  }
+  title.hidden = false; body.hidden = false; body.innerHTML = '';
+  for (const bm of list) {
+    const row = document.createElement('div');
+    row.className = 'outline-row';
+    row.textContent = bm.name || '(未命名书签)';
+    const dest = bm.dest || {};
+    const idx = pageIndexOfDest(doc, dest.page_id);
+    if (idx >= 0) {
+      row.classList.add('clickable');
+      row.title = '跳到第 ' + (idx + 1) + ' 页';
+      row.addEventListener('click', async () => {
+        await loadPage(idx);
+        applyDest(dest);
+      });
+    }
+    body.appendChild(row);
+  }
+}
+
+// 表72/73：附件列表。点一行下载包内附件（/api/attachment/<ID>）。
+function renderAttachments(doc) {
+  const body = $('attachBody');
+  const title = $('attachTitle');
+  if (!body || !title) return;
+  const list = (doc && doc.attachments) || [];
+  if (!list.length) {
+    title.hidden = true; body.hidden = true; body.innerHTML = '';
+    return;
+  }
+  title.hidden = false; body.hidden = false; body.innerHTML = '';
+  for (const at of list) {
+    const row = document.createElement('div');
+    row.className = 'outline-row clickable';
+    const kb = at.size_kb ? ' · ' + at.size_kb + ' KB' : '';
+    row.textContent = (at.name || at.id) + (at.format ? ' (' + at.format + ')' : '') + kb;
+    row.title = '下载附件 ' + (at.name || at.id);
+    row.addEventListener('click', () => {
+      window.open('/api/attachment/' + encodeURIComponent(at.id), '_blank');
+    });
+    body.appendChild(row);
+  }
+}
+
+// 表8/66-71：权限、签名、版本的只读摘要（放进「文档」面板）
+function docExtrasHtml(d) {
+  const rows = [];
+  const perm = d.permissions || {};
+  const bad = [];
+  if (perm.Edit === false) bad.push('编辑');
+  if (perm.Export === false) bad.push('导出');
+  if (perm.Printable === false) bad.push('打印');
+  if (perm.Annot === false) bad.push('标注');
+  if (perm.Signature === false) bad.push('签名');
+  if (perm.Watermark === false) bad.push('水印');
+  if (perm.PrintScreen === false) bad.push('截屏');
+  if (bad.length) {
+    rows.push(`<div class="row"><label>权限</label><div style="color:#c0392b">禁止：${escapeHtml(bad.join('、'))}</div></div>`);
+  }
+  if (perm.Copies != null && perm.Copies !== '') {
+    rows.push(`<div class="row"><label>打印份数</label><div>${escapeHtml(String(perm.Copies))}</div></div>`);
+  }
+  const sig = (d.signatures && d.signatures.items) || [];
+  if (sig.length) {
+    const txt = sig.map((s) => (s.type === 'Seal' ? '签章' : '签名') + '#' + s.id +
+      (s.datetime ? ' ' + s.datetime : '')).join('、');
+    rows.push(`<div class="row"><label>签名</label><div style="word-break:break-all">${escapeHtml(txt)}</div></div>`);
+  }
+  const ver = (d.versions && d.versions.items) || [];
+  if (ver.length) {
+    const txt = ver.map((v) => '#' + v.index + (v.current ? '(当前)' : '')).join('、');
+    rows.push(`<div class="row"><label>版本</label><div>${escapeHtml(txt)}</div></div>`);
+  }
+  const tags = d.custom_tags || [];
+  if (tags.length) {
+    rows.push(`<div class="row"><label>标引</label><div>${tags.length} 组</div></div>`);
+  }
+  const exts = d.extensions || [];
+  if (exts.length) {
+    const names = exts.map((e) => e.app || '扩展').slice(0, 3).join('、');
+    rows.push(`<div class="row"><label>扩展</label><div>${escapeHtml(names)}</div></div>`);
+  }
+  return rows.join('');
+}
+
+// 表9 视图首选项：打开文档时按文件自己的要求设初始缩放
+function applyVPreferences(doc) {
+  const pref = (doc && doc.vpreferences) || {};
+  if (pref.HideToolbar) {
+    const bar = document.querySelector('.toolbar');
+    if (bar) bar.style.display = 'none';
+  } else {
+    const bar = document.querySelector('.toolbar');
+    if (bar) bar.style.display = '';
+  }
+  if (pref.Zoom) {
+    setZoom(pref.Zoom / 100);
+  } else if (pref.ZoomMode) {
+    // 表9：Default/FitHeight/FitWidth/FitRect 四种自动缩放
+    const mode = String(pref.ZoomMode).toLowerCase();
+    if (mode === 'fitwidth') fitWidthOnly();
+    else if (mode === 'fitheight') fitHeightOnly();
+    else if (mode === 'fitrect') fitZoom();
+  }
+  // 表9 PageMode 里点名要看的东西，直接把对应面板亮出来
+  const pm = String(pref.PageMode || '').toLowerCase();
+  if (pm === 'usebookmarks') {
+    const t = $('bookmarkTitle');
+    if (t) t.scrollIntoView({ block: 'nearest' });
+  } else if (pm === 'useattatchs' || pm === 'useattachs') {
+    const t = $('attachTitle');
+    if (t) t.scrollIntoView({ block: 'nearest' });
+  }
 }
 
 function updateFileInfo() {
@@ -194,6 +492,10 @@ function draw() {
       : null,
   });
   drawOverlay();
+  state.actionRegions = collectActionRegions(state.page);
+  if ($('chkActions') && $('chkActions').checked) {
+    drawActionRegions(ctx, state.actionRegions, BASE_PX_PER_MM * state.zoom);
+  }
 }
 
 function drawOverlay() {
@@ -320,6 +622,7 @@ function bindEvents() {
   $('btnZoomOut').onclick = () => setZoom(state.zoom / 1.2);
   $('btnFit').onclick = fitZoom;
   $('chkGrid').onchange = draw;
+  if ($('chkActions')) $('chkActions').onchange = draw;
 
   // Canvas 交互
   const cv = $('cv');
@@ -365,6 +668,9 @@ function bindEvents() {
 function onPointerDown(e) {
   if (!state.page) return;
   const [x, y] = renderer.toMm(e.clientX, e.clientY, $('cv'));
+  // 14 章：先看有没有动作热区命中，命中就执行动作而不是选中对象
+  const region = hitActionRegion(state.actionRegions || [], x, y);
+  if (region && runActions(region)) return;
   if (state.mode === 'place-text') {
     api('/api/edit', {
       op: 'add_text', page: state.pageIndex,
@@ -612,6 +918,31 @@ function fitZoom() {
   setZoom(Math.min(availW / w, availH / h));
 }
 
+// 表9 ZoomMode 与表54 FitH/FitV/FitR 都要求"适合某一边/某块区域"，
+// 一律当整页适应会把 FitWidth 的版面压小
+function fitWidthOnly() {
+  if (!state.page) return;
+  const wrap = $('canvaswrap');
+  setZoom((wrap.clientWidth - 64) / (state.page.size[0] * BASE_PX_PER_MM));
+}
+
+function fitHeightOnly() {
+  if (!state.page) return;
+  const wrap = $('canvaswrap');
+  setZoom((wrap.clientHeight - 64) / (state.page.size[1] * BASE_PX_PER_MM));
+}
+
+function fitRectOnly(left, top, right, bottom) {
+  if (right == null || bottom == null || right <= left || bottom <= top) {
+    fitZoom();
+    return;
+  }
+  const wrap = $('canvaswrap');
+  const rw = (right - left) * BASE_PX_PER_MM;
+  const rh = (bottom - top) * BASE_PX_PER_MM;
+  setZoom(Math.min((wrap.clientWidth - 64) / rw, (wrap.clientHeight - 64) / rh));
+}
+
 /* ------------------------------------------------------------------ 属性 */
 
 function renderProps() {
@@ -703,7 +1034,8 @@ function renderDocProps() {
       <button id="pgRot" style="width:100%">顺时针 90°</button></div></div>
     <div class="row"><label>页操作</label><div style="display:flex;gap:6px">
       <button id="pgAdd" style="flex:1">插页</button>
-      <button id="pgDel" style="flex:1">删页</button></div></div>`;
+      <button id="pgDel" style="flex:1">删页</button></div></div>
+    ${docExtrasHtml(d)}`;
   if ($('pgRot')) {
     $('pgRot').onclick = () => doEdit({
       op: 'page_rotate', page: state.pageIndex,
@@ -872,6 +1204,21 @@ function updateToolbar() {
   ['btnSave', 'btnSaveAs', 'btnPrint', 'btnExport', 'btnFind',
    'btnText', 'btnImage', 'btnRect'].forEach((id) => { $(id).disabled = !has; });
   const d = state.doc || {};
+  // 表8 权限声明：文件自己说不许做什么，就不给按钮留可点状态
+  const perm = d.permissions || {};
+  const deny = (id, allowed, why) => {
+    if (!$(id)) return;
+    if (has && !allowed) {
+      $(id).disabled = true;
+      $(id).title = '文档权限声明禁止' + why;
+    } else {
+      $(id).title = '';
+    }
+  };
+  deny('btnSave', perm.Edit !== false, '编辑');
+  deny('btnSaveAs', perm.Edit !== false, '编辑');
+  deny('btnExport', perm.Export !== false, '导出');
+  deny('btnPrint', perm.Printable !== false, '打印');
   $('btnUndo').disabled = !d.can_undo;
   $('btnRedo').disabled = !d.can_redo;
   $('btnUndo').title = d.undo_label ? '撤销 ' + d.undo_label : '撤销';

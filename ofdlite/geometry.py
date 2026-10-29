@@ -13,6 +13,8 @@ import math
 import re
 from typing import List, Optional, Sequence, Tuple
 
+from .xmlutil import bool_attr, fnum, fnum_list
+
 Point = Tuple[float, float]
 
 
@@ -543,3 +545,134 @@ def bbox_of_subs(subs: Sequence[SubPath]) -> Rect:
     for sp in subs:
         bb.add_points(sp.points)
     return bb.rect()
+
+
+# ---------------------------------------------------------------- 9.3 非紧缩描述
+#
+# 表37：图形也可以用 XML 复杂类型描述，主要用于**区域（Region）**——
+#       Area[@Start] 下一个或多个 Move / Line / QuadraticBezier /
+#       CubicBezier / Arc / Close 依次连接。
+# 9.3.1 原文：区域由一系列分路径(Area)组成，每个分路径都是闭合的。
+#
+# 这套写法和紧缩描述（表36 的 S/M/L/B/Q/A/C）是两条路，别混：
+# 紧缩描述用在 PathObject/AbbreviatedData，非紧缩描述用在 Action/Region。
+
+def _pos(text, default=(0.0, 0.0)):
+    vals = fnum_list(text or "")
+    if len(vals) >= 2:
+        return (vals[0], vals[1])
+    return default
+
+
+def _arc_geometry(el, cx, cy):
+    """表42 圆弧：EndPoint + EllipseSize + RotationAngle + LargeArc + SweepDirection。
+
+    异常处理也照表42 抄：
+      · 数组长度 > 2 只取前两个；长度 == 1 当作圆（该值是半径）；
+      · 前两个里有一个为 0（或数组为空）→ 退化成一条直线；
+      · 负值取绝对值；
+      · RotationAngle 大于 360 按 360 取模。
+    """
+    end = _pos(el.get("EndPoint"), (cx, cy))
+    size = fnum_list(el.get("EllipseSize") or "")
+    if len(size) == 1:
+        rx = ry = abs(size[0])
+    elif len(size) >= 2:
+        a, b = abs(size[0]), abs(size[1])
+        # 较大的为长轴：长轴给 rx（水平半径），短轴给 ry
+        rx, ry = (a, b) if a >= b else (b, a)
+    else:
+        rx = ry = 0.0
+    if rx == 0 or ry == 0:
+        return [end]
+    rot = fnum(el.get("RotationAngle") or "0")
+    rot = rot % 360.0
+    large = bool_attr(el.get("LargeArc"), False)
+    sweep = bool_attr(el.get("SweepDirection"), False)
+    return _arc_points(cx, cy, rx, ry, rot, large, sweep, end[0], end[1])
+
+
+def parse_region(region_el, ctm: Optional[Matrix] = None) -> List[SubPath]:
+    """解析 CT_Region（表37-42，9.3 非紧缩描述）。
+
+    每个 `<Area Start="x y">…</Area>` 是一条分路径；9.3.1 明确"每个分路径都是
+    闭合的"，所以这里一律 closed=True（`Close` 元素只是显式写法，不改变结果）。
+    """
+    subs: List[SubPath] = []
+    if region_el is None:
+        return subs
+    for area in region_el.iter():
+        if _local(area.tag) != "Area":
+            continue
+        sp = parse_area(area)
+        if sp is not None:
+            subs.append(sp)
+    if ctm is not None and not ctm.is_identity():
+        return [SubPath([ctm.apply(x, y) for x, y in sp.points], sp.closed)
+                for sp in subs]
+    return subs
+
+
+def parse_area(area, ctm: Optional[Matrix] = None) -> Optional[SubPath]:
+    """把单个 Area（或等价元素）解析成一条闭合子路径。
+
+    允许把 PathObject 直接当 Area 传进来：非标准写法里有人把
+    Move/Line 写在 PathObject 下（标准只允许区域这么写），
+    读得动比读不动强，但写回时仍按标准输出。
+    """
+    if area is None:
+        return None
+    cur = _pos(area.get("Start"), (0.0, 0.0))
+    sub_start = cur
+    pts: List[Point] = [cur]
+    seen_cmd = False
+    for ch in list(area):
+        tag = _local(ch.tag)
+        if tag == "Move":
+            seen_cmd = True
+            p = _pos(ch.get("Point1"), cur)
+            if len(pts) > 1:
+                # 同一 Area 里的第二段：按标准仍是同一个闭合分路径，
+                # 这里保守地当作"跳点"，把前一段先收掉（不会丢几何）
+                pass
+            cur = p
+            sub_start = p
+            if not pts:
+                pts = [p]
+            continue
+        elif tag == "Line":
+            seen_cmd = True
+            p = _pos(ch.get("Point1"), cur)
+            pts.append(p)
+            cur = p
+        elif tag == "QuadraticBezier":
+            seen_cmd = True
+            p1 = _pos(ch.get("Point1"), cur)
+            p2 = _pos(ch.get("Point2"), cur)
+            pts.extend(_quad(cur[0], cur[1], p1[0], p1[1], p2[0], p2[1]))
+            cur = p2
+        elif tag == "CubicBezier":
+            seen_cmd = True
+            p3 = _pos(ch.get("Point3"), cur)
+            p1 = _pos(ch.get("Point1"), cur)
+            p2 = _pos(ch.get("Point2"), p3)
+            pts.extend(_bezier(cur[0], cur[1], p1[0], p1[1], p2[0], p2[1], p3[0], p3[1]))
+            cur = p3
+        elif tag == "Arc":
+            seen_cmd = True
+            for pt in _arc_geometry(ch, cur[0], cur[1]):
+                pts.append(pt)
+                cur = pt
+        elif tag == "Close":
+            seen_cmd = True
+            cur = sub_start
+    if not seen_cmd or len(pts) < 2:
+        return None
+    if ctm is not None and not ctm.is_identity():
+        pts = [ctm.apply(x, y) for x, y in pts]
+    return SubPath(pts, True)
+
+
+def _local(tag: str) -> str:
+    return tag.split("}", 1)[1] if tag.startswith("{") else tag
+

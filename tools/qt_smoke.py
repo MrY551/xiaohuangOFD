@@ -82,6 +82,27 @@ def main(argv=None):
             raise AssertionError("页数 %r" % (win.pkg.page_count() if win.pkg else None))
         state["pkg"] = win.pkg
 
+    @check("大纲树填充与跳页索引")
+    def _():
+        # 7.8：换一份带大纲的文档，验证树里有项且首项带跳页索引
+        ol_path = os.path.join(ROOT, "out", "ol_test.ofd")
+        if not os.path.exists(ol_path):
+            print("       （跳过：out/ol_test.ofd 不存在）")
+            return
+        win.load_document(ol_path)
+        app.processEvents()
+        n = win.outline.topLevelItemCount()
+        if n < 1:
+            raise AssertionError("大纲树为空")
+        idx = win.outline.topLevelItem(0).data(0, Qt.UserRole)
+        if idx != 0:
+            raise AssertionError("首项跳页索引 %r，期望 0" % idx)
+        if win.outline.topLevelItem(0).childCount() < 1:
+            raise AssertionError("子项没填进去")
+        # 换回原样本，后面的用例还要用
+        win.load_document(os.path.abspath(args.sample))
+        app.processEvents()
+
     @check("画布拿到场景指令")
     def _():
         sc = win.canvas.scene

@@ -112,13 +112,16 @@ OFD/
 │       └── style.css          样式（UKUI 风格）
 ├── tools/
 │   ├── make_sample_ofd.py     生成符合规范的测试 OFD
+│   ├── make_extras_ofd.py     生成"附属结构齐全"的样本（权限/书签/附件/签名/版本/五类动作）
 │   ├── ofd_cli.py             命令行工具
-│   ├── selftest.py            核心库自测（20 项）
+│   ├── selftest.py            核心库自测（30 项）
 │   ├── qt_smoke.py            桌面端冒烟测试（11 项，offscreen）
-│   ├── web_test.py            网页端接口自测（21 项）
+│   ├── web_test.py            网页端接口自测（25 项）
 │   ├── cdp_web_test.py        真实浏览器交互测试（10 项）
 │   ├── real_sample_test.py    真实文件回归（无样本时跳过）
-│   ├── std_gap_probe.py       造"已知不支持"的样本盯差距
+│   ├── std_gap_probe.py       造"已知不支持"的样本盯差距（含颜色/绘制参数/复合对象探针）
+│   ├── std_audit.py           按章节核对标准 ↔ 实现（48 项，产物 标准符合性审计.md）
+│   ├── std_attr_audit.py      按附录 A 的 XSD 逐属性核对（126 个属性）
 │   ├── compare_render.py      与官方渲染做像素级对齐比对
 │   ├── extract_xsd.py         从标准全文抽出附录 A 的 14 个 XSD
 │   └── validate.py            用标准 XSD 校包内 XML
@@ -126,14 +129,18 @@ OFD/
 │   ├── GBT_33190-2016.pdf     标准原文（132 页，扫描件）
 │   ├── GBT_33190-2016.txt     标准全文（提取的文本层，用于搜条款）
 │   ├── xsd/                   附录 A 抽出来的 schema（14 个，可编译）
-│   └── 标准核对记录.md         标准 ↔ 实现的逐条对照
+│   ├── 标准核对记录.md         标准 ↔ 实现的逐条对照（正文 + 37 篇附录）
+│   ├── 标准符合性审计.md       章节级核对结果（脚本生成）
+│   └── 标准属性覆盖.md         属性级核对结果（脚本生成）
 └── packaging/
     └── build_deb.sh           打 deb（含 MIME 注册、桌面项、三个启动器）
 ```
 
-条款级的「标准 ↔ 实现」对照见 [`docs/标准核对记录.md`](docs/标准核对记录.md)：哪些实现被原文确认、
-哪三条是真 bug 已修、还缺哪些章节（注释 / PageRes / HScale / ReadDirection）、
-以及附录 A 里的 XSD 怎么用。
+条款级的「标准 ↔ 实现」对照见 [`docs/标准核对记录.md`](docs/标准核对记录.md)；两张可复现的表见
+[`docs/标准符合性审计.md`](docs/标准符合性审计.md)（48 项：已实现 38 / 部分 9 / 未实现 1）与
+[`docs/标准属性覆盖.md`](docs/标准属性覆盖.md)（126 个属性：有引用 125 / 未引用 1，缺口是 ICC 的 `Profile`）。
+第 18/19/20 章（数字签名、版本、附件）与第 5/6 章（文档特性、文件结构）已经进表；
+权限声明、视图首选项、书签、五类动作、非紧缩描述（9.3）已按标准实现并能验证。
 
 ---
 
@@ -164,6 +171,18 @@ OFD/
 - 变换：CTM 矩阵（旋转/缩放/斜切）、Alpha 透明度、虚线、EvenOdd/NonZeroWinding 填充规则
 - 图片：CTM 是纯缩放时按 Boundary 落位（数电票的 `CTM="30 0 0 20 0 0"` 不能重复缩放）
 - 资源：PublicRes 字体与色彩空间、DocumentRes 多媒体（按 `BaseLoc` 解析相对路径）
+- 文档级附属结构（第 7.5 / 16-20 章，**三端都能用**）：
+  | 条款 | 能力 |
+  |---|---|
+  | 表8 权限声明 | Edit/Annot/Export/Signature/Watermark/PrintScreen + Print(Printable/Copies) + ValidPeriod；网页、CLI、Qt 都按它拦导出/打印/保存 |
+  | 表9 视图首选项 | 初始缩放（Zoom / ZoomMode）、隐藏工具栏/菜单栏 |
+  | 表10 书签 | 右栏书签面板，点击跳页并套用 Dest 的 Zoom |
+  | 表63 / 表64-65 | 自定义标引、扩展信息解析并显示 |
+  | 表66-69 签名 | 列表 + Provider/时间/算法/摘要/StampAnnot/Seal/SignedValue；**只解析不验签** |
+  | 表70-71 版本 | 列表（内嵌 OFD.xml 与独立文件两种写法）+ 版本描述 |
+  | 表72-73 附件 | 列表 + 网页下载 `/api/attachment/<ID>` + CLI `extract-attach` |
+  | 表51-59 动作 | Goto（含 Left/Top/Zoom）/ URI（含 Base/Target）/ GotoA / Sound / Movie + Region 热区 |
+  | 9.3 非紧缩描述 | Start + Move/Line/Q/C/Arc/Close（表37-42），Region 与容错 PathObject 都走它 |
 - 页面：物理尺寸（mm）、旋转属性、多图层、页序
 - 容错：缺命名空间、缺容器节点、路径数据不规范、字体缺失、XML 不良构——都不崩，
   缺什么写进 `warnings`，界面上能看见具体原因
@@ -316,8 +335,8 @@ undo / redo / save / save_as
 五套，都在真实代码路径上跑：
 
 ```bash
-python3 tools/selftest.py          # 20 项：解析、渲染、编辑、撤销、保存字节一致性、导出
-python3 tools/web_test.py          # 21 项：网页端全部接口（自动起停 server）
+python3 tools/selftest.py          # 30 项：解析、渲染、编辑、撤销、保存字节一致性、导出
+python3 tools/web_test.py          # 25 项：网页端全部接口（自动起停 server）
 python3 tools/cdp_web_test.py      # 10 项：真人式点击/拖动/双击/撤销（Edge headless + CDP）
 QT_QPA_PLATFORM=offscreen \
   python3 tools/qt_smoke.py        # 11 项：桌面端窗口、渲染、编辑、QPdfWriter
@@ -394,14 +413,15 @@ sudo dpkg -i dist/xiaohuang-ofd_1.0.0_all.deb
   两者没有字面重合（"楷体" ↔ `simkai.ttf`、"微软雅黑" ↔ `msyh.ttc`），
   所以有一张中文名→文件名前缀的映射表（`font_manager.FILE_HINTS`）。
   映射不到的才按别名降级到宋体。专用字体（方正系列）本机没有时仍会偏。
-- **裁剪区（`Clips`）还没支持**：标准里裁剪是 `Clips/Clip` 子元素（对象空间坐标、多个取交集），
-  目前带裁剪的对象按完整形状绘制（`std_gap_probe.py` 的 `probe_clip.ofd` 就是这个症状）。
-  图表、地图、印章遮罩类文件要注意。
+- **裁剪区已支持**：`Clips/Clip` 子元素，三端渲染一致。两层组合规则按标准实现——
+  多个 `Clip` 取**交集**（表34），一个 `Clip` 内多个 `Area` 取**并集**（表33）。
+  裁剪路径相对对象 `Boundary` 左上角（8.1.4），不是页面坐标。
+  文字作裁剪区时按它的 `Boundary` 矩形近似（标准允许 `Text`，精确做法要按字形轮廓）。
 - **注释已支持**（第15章）：`PageAnnot`/`Annot` 五种类型（`Link`/`Path`/`Highlight`/`Stamp`/`Watermark`），
   外观 `Appearance` 按内容块解析并叠在最上层，签章图片能正常显示。
 - **还没做的**：`Outlines`（大纲）、`Signs`/`Seal`（签名验签）、`Attachments`（附件）、
-  `Clips`（裁剪区）、`Actions`（动作）、`CT_VectorG`（矢量图形复用）——这些**只保留字节、不解释**，
-  不会破坏原文件。`CustomTags`（发票业务数据）同样只保留不解析。
+  `Actions`（动作）、`CT_VectorG`（矢量图形复用）、`DashOffset`（虚线起始偏移）——
+  这些**只保留字节、不解释**，不会破坏原文件。`CustomTags`（发票业务数据）同样只保留不解析。
 - **填充规则**：Pillow 后端按 nonzero 近似处理 EvenOdd（`Rule="Even-Odd"`），Qt 与 Canvas 后端正确。
 - **渐变**：`AxialShd`/`RadialShd`/`GouraudShd`/`Pattern` 未实现，按纯色兜底。
 - **颜色空间**：认 RGB / Gray / CMYK 三种，无 ICC 色彩管理，CMYK 转 RGB 是公式近似。

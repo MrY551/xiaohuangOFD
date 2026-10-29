@@ -46,7 +46,7 @@ def open_ofd(path: str) -> OFDPackage:
 
 
 def render_png(page, dpi: int = 150) -> bytes:
-    from .render_pil import render_to_png
+    from .render_soft import render_to_png
     from .scene import build_page_scene
     sc = build_page_scene(page)
     return render_to_png(sc, sc.resources, dpi=dpi)

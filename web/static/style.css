@@ -174,3 +174,18 @@ canvas#cv.placing { cursor: crosshair; }
   .layout { grid-template-columns: 108px 1fr 220px; }
   .brand-text { display: none; }
 }
+
+/* 7.8 大纲：层级列表，可点跳页 */
+.outline-body { max-height: 40vh; overflow: auto; }
+.outline-row {
+  padding: 3px 6px;
+  font-size: 12px;
+  line-height: 1.5;
+  color: #333;
+  border-radius: 3px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.outline-row.clickable { cursor: pointer; color: #1668dc; }
+.outline-row.clickable:hover { background: #eef4ff; }

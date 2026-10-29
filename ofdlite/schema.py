@@ -45,7 +45,10 @@ def schema_for_entry(name: str) -> Optional[str]:
         return "Annotation.xsd"
     if base == "Signatures.xml":
         return "Signatures.xsd"
-    if re.search(r"Signs/.*Signatures?\.xml$", n):
+    # 签名列表是 Signatures.xsd，单个签名描述文件是 Signature.xsd（附录 A 两个根元素）
+    if base == "Signature.xml":
+        return "Signature.xsd"
+    if re.search(r"Signs/.*Signatures\.xml$", n):
         return "Signatures.xsd"
     if base == "CustomTags.xml":
         return "CustomTags.xsd"
@@ -53,7 +56,9 @@ def schema_for_entry(name: str) -> Optional[str]:
         return "Extensions.xsd"
     if base == "Attachments.xml":
         return "Attachments.xsd"
-    if base == "Versions.xml":
+    # 版本描述文件的根元素是 DocVersion（Version.xsd）。
+    # 版本列表本身没有独立文件：附录 A 把它内嵌在 OFD.xml 的 DocBody 里。
+    if base in ("Versions.xml", "DocVersion.xml") or base.startswith("DocVersion"):
         return "Version.xsd"
     return None
 

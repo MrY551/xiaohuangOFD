@@ -70,6 +70,7 @@ def cmd_info(args):
         return 0
     print("文件: %s" % rep["path"])
     print("包内条目: %d   文档: %d   总页数: %d" % (rep["entries"], rep["documents"], rep["pages"]))
+    print("DocType=%s  Version=%s" % (pkg.doc_type or "-", pkg.ofd_version or "-"))
     for d in rep["docs"]:
         print("\n[%s]  标题=%s  作者=%s" % (d["entry"], d["title"] or "-", d["author"] or "-"))
         print("  字体: %s" % (", ".join("%s=%s" % (k, v) for k, v in d["fonts"].items()) or "无"))
@@ -79,11 +80,88 @@ def cmd_info(args):
                   % (p["index"] + 1, p["size"][0], p["size"][1], p["rotation"],
                      p["layers"], p["objects"],
                      " ".join("%s%d" % (k, v) for k, v in p["kinds"].items())))
+    doc = pkg.document
+    perm = doc.permissions
+    denied = [k for k in ("Edit", "Annot", "Export", "Signature", "Watermark",
+                          "PrintScreen") if perm.get(k) is False]
+    if perm.get("Printable") is False:
+        denied.append("Print")
+    print("\n权限(表8): %s" % ("；".join("禁止" + x for x in denied) if denied else "无限制"))
+    if perm.get("Copies") is not None:
+        print("  打印份数: %s" % (perm["Copies"] if perm["Copies"] >= 0 else "不受限"))
+    period = (perm.get("StartDate") or "") or (perm.get("EndDate") or "")
+    if period:
+        from ofdlite import extras as _ex
+        print("  有效期: %s ~ %s（%s）" % (perm.get("StartDate") or "不限",
+                                          perm.get("EndDate") or "不限",
+                                          _ex.validity_status(perm)))
+    print("大纲(7.8): %d 个顶层节点   书签(表10): %d 个" % (len(doc.outlines()), len(doc.bookmarks)))
+    print("附件(表72): %d 个   标引(表63): %d 组   扩展(表64): %d 条"
+          % (len(doc.attachments), len(doc.custom_tags), len(doc.extensions)))
+    sig = doc.signatures.get("items") or []
+    print("签名(第18章): %s" % (", ".join("%s#%s" % (s["type"] or "Sign", s["id"]) for s in sig)
+                                or "无"))
+    ver = doc.versions.get("items") or []
+    print("版本(第19章): %s" % (", ".join("#%s%s" % (v["index"], "(当前)" if v["current"] else "")
+                                         for v in ver) or "无"))
+    return 0
+
+
+def cmd_extras(args):
+    """把第 7.5 / 16 / 17 / 18 / 19 / 20 章的附属结构一次打全。"""
+    pkg = OFDPackage.open(args.file)
+    doc = pkg.document
+    data = {
+        "doc_type": pkg.doc_type,
+        "ofd_version": pkg.ofd_version,
+        "permissions": doc.permissions,
+        "vpreferences": doc.vpreferences,
+        "bookmarks": doc.bookmarks,
+        "attachments": doc.attachments,
+        "custom_tags": doc.custom_tags,
+        "extensions": doc.extensions,
+        "signatures": doc.signatures,
+        "versions": doc.versions,
+    }
+    print(json.dumps(data, ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_extract_attach(args):
+    """第20章：把附件内容写出来。"""
+    pkg = OFDPackage.open(args.file)
+    doc = pkg.document
+    if not doc.attachments:
+        print("这份文档没有附件（表72）")
+        return 1
+    picked = doc.attachments
+    if args.id:
+        picked = [a for a in doc.attachments if a["id"] == args.id]
+        if not picked:
+            print("没有 ID 为 %s 的附件；现有：%s"
+                  % (args.id, ", ".join(a["id"] for a in doc.attachments)))
+            return 1
+    outdir = args.out or "."
+    if not os.path.isdir(outdir):
+        os.makedirs(outdir)
+    for att in picked:
+        entry = att.get("entry") or ""
+        if not entry or not pkg.has(entry):
+            print("跳过 %s：附件条目缺失 %s" % (att["id"], entry or "(空)"))
+            continue
+        name = att.get("name") or os.path.basename(entry) or ("attachment-%s" % att["id"])
+        target = os.path.join(outdir, os.path.basename(name))
+        with open(target, "wb") as fh:
+            fh.write(pkg.read(entry))
+        print("%s -> %s（%s KB）" % (att["id"], target,
+                                     att.get("size_kb") if att.get("size_kb") is not None
+                                     else round(len(pkg.read(entry)) / 1024.0, 1)))
     return 0
 
 
 def cmd_text(args):
     pkg = OFDPackage.open(args.file)
+    _check_perm(pkg, "Export", "导出")
     text = convert.export_text(pkg, args.out or "")
     if not args.out:
         sys.stdout.write(text)
@@ -92,9 +170,72 @@ def cmd_text(args):
     return 0
 
 
-def cmd_render(args):
-    from ofdlite.render_pil import render_page
+def cmd_outline(args):
+    """打印文档大纲（7.8），带层级缩进与跳页目标。"""
     pkg = OFDPackage.open(args.file)
+    tree = pkg.document.outlines()
+    if not tree:
+        print("（本文档没有大纲）")
+        return 0
+    pages = pkg.all_pages()
+    id2idx = {str(p.id): i for i, p in enumerate(pages)}
+
+    def walk(nodes, depth):
+        for n in nodes:
+            act = next((a for a in n.get("actions") or [] if a.get("kind") == "goto"), None)
+            tail = ""
+            if act and act.get("dest") in id2idx:
+                tail = "  -> 第 %d 页" % (id2idx[act["dest"]] + 1)
+            elif act and act.get("bookmark"):
+                tail = "  -> 书签 %s" % act["bookmark"]
+            uri = next((a for a in n.get("actions") or [] if a.get("kind") == "uri"), None)
+            if uri:
+                tail = "  -> %s" % uri.get("uri", "")
+            print("%s%s%s" % ("  " * depth, n.get("title") or "(无标题)", tail))
+            walk(n.get("children") or [], depth + 1)
+
+    walk(tree, 0)
+    return 0
+
+
+def _check_perm(pkg, key, what):
+    """表8 权限声明：文件写明的限制要在命令行也生效。"""
+    from ofdlite import extras
+    doc = pkg.document
+    perm = doc.permissions if doc is not None else {}
+    state = extras.validity_status(perm)
+    if state == "expired":
+        sys.stderr.write("文档已过访问有效期（表8 ValidPeriod），不能%s\n" % what)
+        raise SystemExit(3)
+    if state == "not-started":
+        sys.stderr.write("文档访问有效期未开始（表8 ValidPeriod），不能%s\n" % what)
+        raise SystemExit(3)
+    if perm.get(key, True) is False:
+        sys.stderr.write("文档权限声明禁止%s（表8 %s=false）\n" % (what, key))
+        raise SystemExit(3)
+
+
+def _check_print(pkg, copies):
+    from ofdlite import extras
+    doc = pkg.document
+    perm = doc.permissions if doc is not None else {}
+    state = extras.validity_status(perm)
+    if state in ("expired", "not-started"):
+        sys.stderr.write("文档访问有效期不允许打印（表8 ValidPeriod: %s）\n" % state)
+        raise SystemExit(3)
+    limit = extras.printable_count(perm)
+    if limit == 0:
+        sys.stderr.write("文档权限声明禁止打印（表8 Printable=false 或 Copies=0）\n")
+        raise SystemExit(3)
+    if limit is not None and copies > limit:
+        sys.stderr.write("文档权限声明限定最多打印 %d 份（表8 Copies）\n" % limit)
+        raise SystemExit(3)
+
+
+def cmd_render(args):
+    from ofdlite.render_soft import render_page
+    pkg = OFDPackage.open(args.file)
+    _check_perm(pkg, "Export", "导出")
     pages = pkg.all_pages()
     idx = _pages_arg(args.pages, len(pages))
     outdir = args.out or "out"
@@ -111,6 +252,7 @@ def cmd_render(args):
 
 def cmd_pdf(args):
     pkg = OFDPackage.open(args.file)
+    _check_perm(pkg, "Export", "导出")
     out = args.out or os.path.splitext(args.file)[0] + ".pdf"
     idx = _pages_arg(args.pages, pkg.page_count())
 
@@ -126,6 +268,7 @@ def cmd_pdf(args):
 
 def cmd_svg(args):
     pkg = OFDPackage.open(args.file)
+    _check_perm(pkg, "Export", "导出")
     pages = pkg.all_pages()
     idx = _pages_arg(args.pages, len(pages))
     outdir = args.out or "out"
@@ -180,6 +323,7 @@ def cmd_edit(args):
 def cmd_print(args):
     from ofdlite import print_linux
     pkg = OFDPackage.open(args.file)
+    _check_print(pkg, args.copies)
     idx = _pages_arg(args.pages, pkg.page_count())
     res = print_linux.print_document(
         pkg, printer=args.printer or print_linux.default_printer(),
@@ -218,7 +362,7 @@ def cmd_fonts(args):
 def cmd_uidemo(args):
     """没装 Qt 时也能看效果：用 Pillow 模拟主界面截图。"""
     from PIL import Image, ImageDraw, ImageFont
-    from ofdlite.render_pil import render_page
+    from ofdlite.render_soft import render_page
 
     pkg = OFDPackage.open(args.file)
     page_img, _w = render_page(pkg.all_pages()[0], dpi=96)
@@ -305,6 +449,10 @@ def main(argv=None):
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_info)
 
+    p = sub.add_parser("outline", help="打印文档大纲（7.8）")
+    p.add_argument("file", help="OFD 文件")
+    p.set_defaults(func=cmd_outline)
+
     p = sub.add_parser("text", help="导出文本")
     p.add_argument("file")
     p.add_argument("-o", "--out")
@@ -351,6 +499,16 @@ def main(argv=None):
     p.add_argument("--dpi", type=int, default=200)
     p.add_argument("--keep-pdf", dest="keep_pdf")
     p.set_defaults(func=cmd_print)
+
+    p = sub.add_parser("extras", help="打印权限/视图/书签/附件/签名/版本（7.5、16-20 章）")
+    p.add_argument("file")
+    p.set_defaults(func=cmd_extras)
+
+    p = sub.add_parser("extract-attach", help="导出附件（第20章）")
+    p.add_argument("file")
+    p.add_argument("--id", help="附件 ID，省略则全部导出")
+    p.add_argument("-o", "--out", help="输出目录，默认当前目录")
+    p.set_defaults(func=cmd_extract_attach)
 
     p = sub.add_parser("printers", help="列出打印机")
     p.set_defaults(func=cmd_printers)

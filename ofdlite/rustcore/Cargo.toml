@@ -1,0 +1,16 @@
+[package]
+name = "ofd_core"
+version = "1.0.0"
+edition = "2021"
+description = "小黄OFD 的 Rust 加速内核：扫描线光栅化与像素混合（GB/T 33190-2016 的图形渲染）"
+license-file = "../../LICENSE"
+
+[lib]
+name = "ofd_core"
+crate-type = ["cdylib"]
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"

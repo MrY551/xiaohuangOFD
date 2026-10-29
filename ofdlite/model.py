@@ -17,9 +17,12 @@ import zipfile
 from typing import Dict, List, Optional, Sequence, Tuple
 
 from . import colors as colorlib
+from . import extras
 from . import geometry as geo
 from . import xmlutil as X
 from .errors import ParseError, ResourceMissing
+
+extras.bind(X)
 
 # 对象类型名 → 模型类，由 reader 注册
 _OBJ_TYPES = {}
@@ -36,6 +39,224 @@ def register_object(local_name: str):
 
 # ==================================================================== 包
 
+def _abbrev_to_subpaths(data: str):
+    """把 AbbreviatedData 解析成若干子路径的点序列（mm，相对对象空间原点）。
+
+    裁剪只需要折线点，曲线按固定段数压平——裁剪边界宁可略保守也不要错位。
+    真正的解析在 geometry.parse_path_data（它已经把曲线压平成折线）。
+    """
+    try:
+        from . import geometry as geo
+        subs = geo.parse_path_data(data)
+    except Exception:
+        return []
+    out = []
+    for sp in subs:
+        pts = []
+        # SubPath 可能是 (points, closed) 或带 .points 的对象，两种都兼容
+        raw = sp.points if hasattr(sp, "points") else (sp[0] if isinstance(sp, tuple) else sp)
+        for pt in raw:
+            if isinstance(pt, (tuple, list)) and len(pt) >= 2:
+                pts.extend([float(pt[0]), float(pt[1])])
+        if len(pts) >= 4:
+            out.append(pts)
+    return out
+
+
+class Shading(object):
+    """渐变/底纹填充（8.3.3 / 8.3.4）。
+
+    CT_Color 里除基本颜色外还能装五种填充，统一用这个类承载：
+
+        Pattern          底纹（8.3.3）
+        AxialShd         轴向渐变（线性）
+        RadialShd        径向渐变（可带离心率与倾角）
+        GouraudShd       高洛德渐变（三角网格顶点色插值）
+        LaGourandShd     网格高洛德（二维网格插值，标准拼写如此，少个 u）
+
+    坐标都是**对象空间**（相对 Boundary 左上角），与路径数据同一坐标系。
+    """
+
+    __slots__ = ("kind", "el", "segments", "attrs", "doc")
+
+    KINDS = ("Pattern", "AxialShd", "RadialShd", "GouraudShd", "LaGourandShd")
+
+    def __init__(self, kind: str, el, doc=None):
+        self.kind = kind
+        self.el = el
+        self.attrs = el
+        self.doc = doc
+        self.segments = self._parse_segments(el)
+
+    def _parse_segments(self, el):
+        # 段颜色也是 CT_Color，ColorSpace 同样要回资源里查（8.3.1）
+        return self._parse_segments_impl(el, self.doc)
+
+    def _color(self, el, default=None):
+        return parse_color_el(el, self.doc, default)
+
+    @staticmethod
+    def _parse_segments_impl(el, doc):
+        """Segment：Position（0..1，可省）+ Color（CT_Color，基本颜色）。
+
+        表29 / 表30：不写 Position 时按出现顺序平均分配；
+        第一个默认 0，最后一个默认 1.0，中间的在空缺区间内均分。
+        """
+        segs = []
+        for seg in X.find_all(el, "Segment"):
+            color_el = X.find(seg, "Color")
+            if color_el is None:
+                continue
+            rgba = parse_color_el(color_el, doc, (0, 0, 0, 1)) or (0, 0, 0, 1)
+            pos = seg.get("Position")
+            segs.append((None if pos in (None, "") else X.fnum(pos, None), rgba))
+        if not segs:
+            return []
+        # 补 Position：首 0、尾 1.0、中间按已给的锚点分段均分
+        n = len(segs)
+        out = []
+        for i, (pos, rgba) in enumerate(segs):
+            if pos is None:
+                if i == 0:
+                    pos = 0.0
+                elif i == n - 1:
+                    pos = 1.0
+            out.append([pos, rgba])
+        # 中间空缺：在前后已知锚点之间均分
+        known = [i for i, (pos, _) in enumerate(out) if pos is not None]
+        for a, b in zip(known, known[1:]):
+            if b - a > 1:
+                p0, p1 = out[a][0], out[b][0]
+                for k in range(a + 1, b):
+                    out[k][0] = p0 + (p1 - p0) * (k - a) / float(b - a)
+        for item in out:
+            if item[0] is None:
+                item[0] = 0.0
+        out.sort(key=lambda x: x[0])
+        return [(float(p), c) for p, c in out]
+
+    # ---- 通用属性
+    def map_type(self) -> str:
+        return (self.el.get("MapType") or "Direct")
+
+    def map_unit(self):
+        v = self.el.get("MapUnit")
+        return X.fnum(v, 0.0) if v not in (None, "") else None
+
+    def extend(self) -> int:
+        v = self.el.get("Extend")
+        return int(X.fnum(v, 0)) if v not in (None, "") else 0
+
+    def points(self):
+        """返回 (StartPoint, EndPoint)，ST_Pos 两个值。"""
+        def pair(name):
+            v = X.fnum_list(self.el.get(name) or "")
+            return (v[0], v[1]) if len(v) >= 2 else (0.0, 0.0)
+        return pair("StartPoint"), pair("EndPoint")
+
+    # ---- 径向专有
+    def edge_flag(self):
+        """表 31：三角单元切换的方向标志。
+
+        决定网格单元里两条对角线用哪一条：0 走「左上-右下」，
+        1 走「右上-左下」。网格高洛德（表 32）固定为 1。
+        """
+        v = self.el.get("EdgeFlag") if hasattr(self, "el") else None
+        if v is None:
+            return None
+        try:
+            return int(float(v))
+        except (TypeError, ValueError):
+            return None
+
+    def radii(self):
+        r0 = X.fnum(self.el.get("StartRadius"), 0.0)
+        r1 = X.fnum(self.el.get("EndRadius"), 0.0)
+        return r0, r1
+
+    def eccentricity(self) -> float:
+        return X.fnum(self.el.get("Eccentricity"), 0.0)
+
+    def angle(self) -> float:
+        return X.fnum(self.el.get("Angle"), 0.0)
+
+    def control_points(self):
+        """高洛德渐变的控制点：[{x, y, edge_flag, rgba}]，坐标是对象空间 mm。
+
+        表31：Point 至少 3 个，X/Y 必选，Color 必选，EdgeFlag 可选。
+        网格高洛德（LaGourandShd）只是把同一批点按 VerticesPerRow 组成网格，
+        点的结构一样。
+        """
+        out = []
+        for pt in X.find_all(self.el, "Point"):
+            rgba = (0, 0, 0, 1)
+            cel = X.find(pt, "Color")
+            if cel is not None:
+                rgba = self._color(cel, (0, 0, 0, 1)) or (0, 0, 0, 1)
+            out.append({
+                "x": X.fnum(pt.get("X"), 0.0),
+                "y": X.fnum(pt.get("Y"), 0.0),
+                "edge_flag": int(X.fnum(pt.get("EdgeFlag"), 0)),
+                "rgba": rgba,
+            })
+        return out
+
+    def back_color(self):
+        cel = X.find(self.el, "BackColor")
+        if cel is None:
+            return None
+        return self._color(cel, None)
+
+    def vertices_per_row(self):
+        v = self.el.get("VerticesPerRow")
+        return int(X.fnum(v, 0)) if v not in (None, "") else None
+
+    # ---------------------------------------------------------- 底纹（8.3.3）
+
+    def pattern_attrs(self):
+        """底纹的平铺参数（表 CT_Pattern）。
+
+        Width / Height 是**单元格尺寸**（必选）；XStep / YStep 是平铺步长，
+        不写时等于 Width / Height。RelativeTo 决定起点相对页面还是相对对象，
+        默认 Object。ReflectMethod 控制相邻格是否镜像。
+        """
+        w = X.fnum(self.el.get("Width"), 0.0)
+        h = X.fnum(self.el.get("Height"), 0.0)
+        xs = self.el.get("XStep")
+        ys = self.el.get("YStep")
+        return {
+            "w": w,
+            "h": h,
+            "xstep": X.fnum(xs, w) if xs not in (None, "") else w,
+            "ystep": X.fnum(ys, h) if ys not in (None, "") else h,
+            "reflect": (self.el.get("ReflectMethod") or "Normal"),
+            "relative_to": (self.el.get("RelativeTo") or "Object"),
+            "ctm": X.fnum_list(self.el.get("CTM")) or [],
+        }
+
+    def pattern_cell(self, page):
+        """把 CellContent 里的图元包成对象列表（可递归含任意图元）。
+
+        CellContent 是 CT_PageBlock，与页面图层同构，所以复用同一套对象工厂。
+        没有 page 上下文时返回空（底纹必须挂在某个页上才能解析资源）。
+        """
+        node = X.find(self.el, "CellContent")
+        if node is None or page is None:
+            return []
+        out = []
+        for ch in list(node):
+            cls = _OBJ_TYPES.get(X.local(ch.tag))
+            if cls is not None:
+                out.append(cls(page, ch, None))
+        return out
+
+    def describe(self) -> str:
+        if self.kind in ("GouraudShd", "LaGourandShd"):
+            return "%s %d 点" % (self.kind, len(self.control_points()))
+        st, en = self.points()
+        return "%s %d 段" % (self.kind, len(self.segments))
+
+
 class OFDPackage(object):
     """一个 .ofd 文件（其实是 zip 容器）。"""
 
@@ -45,6 +266,8 @@ class OFDPackage(object):
         self.dirty: set = set()                    # 需要重写的条目名
         self.xml_roots: Dict[str, "object"] = {}   # 条目名 → Element（已解析）
         self.ofd_root = None                       # OFD.xml 的根
+        self.doc_type = ""                         # 表3：OFD / OFD-A
+        self.ofd_version = ""                      # 表3：固定 1.0
         self.documents: List["Document"] = []
         self._entry_order: List[str] = []
         self._id_counter = 1000
@@ -95,6 +318,9 @@ class OFDPackage(object):
         self.ofd_root = self.parse_xml(root_name)
         if self.ofd_root is None:
             raise ParseError("OFD.xml 解析失败")
+        # 表3：DocType 取值 OFD（符合本标准）或 OFD-A（符合存档规范），Version 固定 1.0
+        self.doc_type = (self.ofd_root.get("DocType") or "").strip()
+        self.ofd_version = (self.ofd_root.get("Version") or "").strip()
 
         bodies = X.find_all(self.ofd_root, "DocBody")
         if not bodies:
@@ -114,6 +340,14 @@ class OFDPackage(object):
                     if el is not None and (el.text or "").strip():
                         setattr(doc, attr, el.text.strip())
             doc.load()
+            # 7.5 表8/9/10 与 16/17 章在 Document 里；18/19 章挂在 OFD.xml 的 DocBody 上
+            try:
+                doc.load_extras(body, root_name)
+            except Exception:
+                # 附属结构坏了不该让整个文件打不开
+                pass
+            doc.doc_type = self.doc_type
+            doc.ofd_version = self.ofd_version
             self.documents.append(doc)
         if not self.documents:
             raise ParseError("OFD.xml 里没有可用的 DocRoot")
@@ -275,6 +509,21 @@ class Document(object):
         self.author = ""
         self.creator = ""
         self.subject = ""
+        # ---- 第 7.5 / 16 / 17 / 18 / 19 / 20 章的文档级结构
+        # 这些不参与排版，但决定"能不能导出/打印/看书签/取附件"。
+        self.permissions: dict = dict(extras.PERM_DEFAULTS)
+        self.vpreferences: dict = dict(extras.V_PREF_DEFAULTS)
+        self.bookmarks: List[dict] = []
+        self.attachments: List[dict] = []
+        self.custom_tags: List[dict] = []
+        self.extensions: List[dict] = []
+        self.signatures: dict = {"items": []}
+        self.versions: dict = {"items": []}
+        self.doc_type = ""
+        self.ofd_version = ""
+        self.attachments_entry = ""
+        self.custom_tags_entry = ""
+        self.extensions_entry = ""
 
     # ---------------------------------------------------------- 装载
     def load(self) -> None:
@@ -358,11 +607,51 @@ class Document(object):
         for page in self.pages:
             page.load_annotations()
 
-    def load_annotation_index(self) -> None:
-        """读注释列表文件：Page(PageID, FileLoc)。
+    def load_extras(self, body=None, ofd_entry: str = "") -> None:
+        """文档级附属结构（7.5 表8/9/10、16、17、18、19、20 章）。
 
-        表60：注释在列表文件里按页面组织索引，内容在分页注释文件里描述。
+        这些章节不影响排版，但决定"能不能导出/打印、有没有书签/附件/签名"。
+        解析失败一律退化成默认值，不给打开文件添堵。
         """
+        # 表8 / 表9 / 表10：Document 根的直接子元素（Outlines 之后）
+        self.permissions = extras.parse_permissions(self.root)
+        self.vpreferences = extras.parse_vpreferences(self.root)
+        self.bookmarks = extras.parse_bookmarks(self.root)
+
+        # 表5：Attachments / CustomTags / Extensions 都是 ST_Loc
+        parents = [p for p in (X.find(self.root, "CommonData"), self.root)
+                   if p is not None]
+        for attr, tag in (("attachments_entry", "Attachments"),
+                          ("custom_tags_entry", "CustomTags"),
+                          ("extensions_entry", "Extensions")):
+            for parent in parents:
+                el = X.find(parent, tag)
+                if el is not None and (el.text or "").strip():
+                    setattr(self, attr, self.pkg.resolve(
+                        self.entry, el.text.strip()))
+                    break
+        self.attachments = extras.parse_attachments(self.pkg, self.attachments_entry)
+        self.custom_tags = extras.parse_custom_tags(self.pkg, self.custom_tags_entry)
+        self.extensions = extras.parse_extensions(self.pkg, self.extensions_entry)
+
+        # 表3：Signatures / Versions 挂在 OFD.xml 的 DocBody 上（不是 Document）
+        if body is not None:
+            base = ofd_entry or self.entry
+            el = X.find(body, "Signatures")
+            if el is not None and (el.text or "").strip():
+                self.signatures = extras.parse_signatures(
+                    self.pkg, self.pkg.resolve(base, el.text.strip()))
+            el = X.find(body, "Versions")
+            if el is not None:
+                if (el.text or "").strip():
+                    # 版本列表指向独立文件
+                    self.versions = extras.parse_versions(
+                        self.pkg, self.pkg.resolve(base, el.text.strip()))
+                else:
+                    # 附录 A：版本列表直接内嵌在 OFD.xml 的 DocBody 里
+                    self.versions = extras.parse_versions_el(el, self.pkg, base)
+
+    def load_annotation_index(self) -> None:
         root = self.pkg.parse_xml(self.annotations_entry)
         if root is None:
             return
@@ -381,22 +670,60 @@ class Document(object):
                 return f
         return None
 
-    def find_colorspace(self, cs_id: str):
+    def find_vectorg(self, vid: str):
+        """第 13 章：按 ID 取矢量图像资源（CT_VectorG）。"""
+        key = str(vid)
         for res in self.public_res:
-            cs = res.colorspaces.get(str(cs_id))
+            got = res.vectorgs.get(key)
+            if got is not None:
+                return got
+        if self.doc_res is not None and hasattr(self.doc_res, "vectorgs"):
+            return self.doc_res.vectorgs.get(key)
+        return None
+
+    def find_colorspace(self, cs_id: str):
+        """按 ID 取颜色空间描述：{type, bpc, palette}。
+
+        8.3.1：ColorSpace 属性是 ST_RefID，要回资源文件里查 Type/BPC/调色板，
+        不能拿 "1"/"5" 这种数字自己猜颜色空间。
+        """
+        if cs_id in (None, ""):
+            return None
+        key = str(cs_id)
+        for res in self.public_res:
+            cs = res.colorspaces.get(key)
             if cs:
                 return cs
         return None
 
-    def find_drawparam(self, dp_id: str):
-        """查 DrawParam。PublicRes 与 DocumentRes 两处都看。"""
+    def find_drawparam(self, dp_id: str, _depth: int = 0):
+        """查 DrawParam。PublicRes 与 DocumentRes 两处都看。
+
+        表21：绘制参数可以通过 Relative 继承**基础绘制参数**，形成嵌套；
+        被继承的参数里的属性会传下来，子参数重定义的同名属性覆盖父参数。
+        链上出现环（非法文件）时停手，不死循环。
+        """
         key = str(dp_id)
+        base = None
         for res in self.public_res:
             if key in res.drawparams:
-                return res.drawparams[key]
-        if self.doc_res is not None and key in self.doc_res.drawparams:
-            return self.doc_res.drawparams[key]
-        return None
+                base = res.drawparams[key]
+                break
+        if base is None and self.doc_res is not None:
+            base = self.doc_res.drawparams.get(key)
+        if base is None:
+            return None
+        parent_id = base.get("Relative")
+        if not parent_id or _depth > 16:
+            return base
+        parent = self.find_drawparam(parent_id, _depth + 1)
+        if parent is None:
+            return base
+        merged = dict(parent)
+        for k, v in base.items():
+            if v is not None:
+                merged[k] = v
+        return merged
 
     def find_image(self, res_id: str) -> Optional[Tuple[str, bytes]]:
         """返回 (文件名, 字节)。找不到返回 None。"""
@@ -408,6 +735,99 @@ class Document(object):
         return (os.path.basename(entry), self.pkg.read(entry))
 
     # ---------------------------------------------------------- 页面操作
+    # ---------------------------------------------------------- 大纲（7.8）
+
+    def outlines(self):
+        """文档大纲树（7.8 / CT_OutlineElem）。
+
+        返回 [{title, count, expanded, actions, children}] 的列表。
+        标准里 Outlines 挂在 CommonData 下，每个 OutlineElem 可递归嵌套，
+        Title 必选、Expanded 默认 true。
+        """
+        # 7.8：Outlines 是 Document 根的直接子元素，位置在 CommonData **之后**、
+        # Permissions 之前（附录 A 的 Document sequence）。不是 CommonData 的子元素。
+        node = X.find(self.root, "Outlines")
+        if node is None:
+            return []
+        return [self._outline_elem(el) for el in X.find_all(node, "OutlineElem")]
+
+    def _outline_elem(self, el):
+        acts = []
+        an = X.find(el, "Actions")
+        if an is not None:
+            acts = [a for a in X.find_all(an, "Action")]
+        return {
+            "title": el.get("Title") or "",
+            "count": el.get("Count"),
+            "expanded": X.bool_attr(el.get("Expanded"), True),
+            "actions": [self._action_desc(a) for a in acts],
+            "children": [self._outline_elem(c) for c in X.find_all(el, "OutlineElem")],
+        }
+
+    def _action_desc(self, el):
+        """把一个 <Action> 解成可读描述（第14章 / CT_Action，表51-59）。
+
+        五类动作全解析：Goto（表53/54）、URI（表56）、GotoA（表55）、
+        Sound（表57）、Movie（表58）。执行仍然只做 goto / uri / 打开附件，
+        音视频只报信息（本工具不放音视频）。
+        """
+        ev = (el.get("Event") or "CLICK").upper()
+        out = {"event": ev}
+
+        # 表51：Region 是动作的启动区域（9.3 非紧缩描述的那套写法）
+        region = X.find(el, "Region")
+        if region is not None:
+            subs = geo.parse_region(region)
+            if subs:
+                box = geo.bbox_of_subs(subs)
+                out["region"] = {"bbox": [box.x, box.y, box.w, box.h],
+                                 "areas": len(subs)}
+
+        goto = X.find(el, "Goto")
+        if goto is not None:
+            dest = X.find(goto, "Dest")
+            bm = X.find(goto, "Bookmark")
+            if bm is not None:
+                out["kind"] = "goto"
+                out["bookmark"] = bm.get("Name") or ""
+            elif dest is not None:
+                out["kind"] = "goto"
+                # 兼容旧前端：dest 仍是页面 ID 字符串，细节放 dest_detail
+                out["dest"] = dest.get("PageID") or dest.get("Type") or ""
+                out["dest_detail"] = extras.parse_dest(dest)
+
+        uri = X.find(el, "URI")
+        if uri is not None:
+            out["kind"] = "uri"
+            out["uri"] = uri.get("URI") or ""
+            out["base"] = uri.get("Base") or ""
+            # 附录 A 的 URI 动作还带一个 Target（打开的目标窗口名），正文表56 没写
+            out["target"] = uri.get("Target") or ""
+
+        ga = X.find(el, "GotoA")
+        if ga is not None:
+            out["kind"] = "gotoa"
+            out["attach_id"] = ga.get("AttachID") or ""
+            out["new_window"] = X.bool_attr(ga.get("NewWindow"), True)
+
+        snd = X.find(el, "Sound")
+        if snd is not None:
+            out["kind"] = "sound"
+            out["resource_id"] = snd.get("ResourceID") or ""
+            out["volume"] = int(X.fnum(snd.get("Volume"), 100))
+            out["repeat"] = X.bool_attr(snd.get("Repeat"), False)
+            out["synchronous"] = X.bool_attr(snd.get("Synchronous"), False)
+
+        mv = X.find(el, "Movie")
+        if mv is not None:
+            out["kind"] = "movie"
+            out["resource_id"] = mv.get("ResourceID") or ""
+            out["operator"] = mv.get("Operator") or "Play"
+
+        if "kind" not in out:
+            out["kind"] = "unknown"
+        return out
+
     def default_page_size(self) -> geo.Rect:
         if self.page_area is not None and not self.page_area.is_empty():
             return geo.Rect(self.page_area.x, self.page_area.y,
@@ -511,6 +931,9 @@ class PublicRes(object):
         self.fonts: Dict[str, "FontSpec"] = {}
         self.colorspaces: Dict[str, str] = {}
         self.drawparams: Dict[str, dict] = {}
+        # 第 13 章：矢量图像资源（CT_VectorG），复合对象的内容在这里。
+        # {ID: {"w":..., "h":..., "content": <Element 或 None>, "thumb":..., "sub":...}}
+        self.vectorgs: Dict[str, dict] = {}
 
     def load(self) -> None:
         root = self.doc.pkg.parse_xml(self.entry)
@@ -518,6 +941,23 @@ class PublicRes(object):
             return
         self.root = root
         self.base_loc = (root.get("BaseLoc") or "").strip()
+        # 表 50：矢量图像 CT_VectorG —— Width/Height 是裁剪边界，Content 是页面块
+        # 元素名按标准/附录 A 是 CompositeGraphicUnit（注意 Graphic 里的 ic）；
+        # 早期本项目写成了 CompositeGraphUnit，标准件一个都读不到（见 docs 核对记录）。
+        for vel in list(X.deepfind_all(root, "CompositeGraphicUnit")) + \
+                list(X.deepfind_all(root, "CompositeGraphUnit")):
+            vid = vel.get("ID") or ""
+            if not vid:
+                continue
+            cel = X.find(vel, "Content")
+            self.vectorgs[vid] = {
+                "w": X.fnum(vel.get("Width"), 0.0),
+                "h": X.fnum(vel.get("Height"), 0.0),
+                "content": cel,
+                "thumb": (X.find(vel, "Thumbnail") is not None),
+                "sub": (X.find(vel, "Substitution") is not None),
+            }
+
         # Font 在 Fonts 容器里，ColorSpace 在 ColorSpaces 里，用深度遍历兜住
         # 不同厂商把容器省掉直接挂 Font 的情况
         for fel in X.deepfind_all(root, "Font"):
@@ -534,16 +974,29 @@ class PublicRes(object):
                 (fel.get("Italic") or "").lower() == "true",
                 X.find(fel, "FontFile") is not None,
                 self,
+                X.bool_attr(fel.get("FixedWidth"), False),
             )
+        # 表25：颜色空间带 Type / BitsPerComponent / Palette(CV)，
+        # 颜色取值要靠这三样才能算对（8.3.2），所以连调色板一起存。
         for cel in X.deepfind_all(root, "ColorSpace"):
             cid = cel.get("ID") or ""
-            if cid:
-                self.colorspaces[cid] = cel.get("Type") or cel.get("Name") or ""
+            if not cid:
+                continue
+            palette = []
+            for cv in X.deepfind_all(cel, "CV"):
+                vals = X.fnum_list(cv.text or "")
+                if vals:
+                    palette.append(vals)
+            self.colorspaces[cid] = {
+                "type": cel.get("Type") or cel.get("Name") or "",
+                "bpc": int(X.fnum(cel.get("BitsPerComponent"), 8)) or 8,
+                "palette": palette,
+            }
         # DrawParam 的标准位置是 PublicRes/DrawParams，DocumentRes 里也可能有
         for dp in X.deepfind_all(root, "DrawParam"):
             did = dp.get("ID") or ""
             if did:
-                self.drawparams[did] = parse_draw_param(dp)
+                self.drawparams[did] = parse_draw_param(dp, self.doc)
 
     def font_file_entry(self, font: "FontSpec") -> Optional[str]:
         """如果字体有内嵌 FontFile，返回包内路径。"""
@@ -566,9 +1019,10 @@ class PublicRes(object):
 
 class FontSpec(object):
     __slots__ = ("id", "name", "family", "charset", "serif", "bold", "italic",
-                 "embedded", "owner")
+                 "embedded", "owner", "fixed_width")
 
-    def __init__(self, fid, name, family, charset, serif, bold, italic, embedded, owner):
+    def __init__(self, fid, name, family, charset, serif, bold, italic, embedded,
+                 owner, fixed_width=False):
         self.id = fid
         self.name = name
         self.family = family
@@ -578,6 +1032,8 @@ class FontSpec(object):
         self.italic = italic
         self.embedded = embedded
         self.owner = owner
+        # 表44 FixedWidth：true 表示这是等宽字型（每个字形都占满 em）
+        self.fixed_width = bool(fixed_width)
 
     def display_name(self) -> str:
         return self.family or self.name or ("Font-%s" % self.id)
@@ -586,7 +1042,7 @@ class FontSpec(object):
         return "FontSpec(%s, %s)" % (self.id, self.display_name())
 
 
-def parse_draw_param(el) -> dict:
+def parse_draw_param(el, doc=None) -> dict:
     """把一个 <DrawParam> 元素解析成属性字典。
 
     颜色是子元素：
@@ -594,12 +1050,18 @@ def parse_draw_param(el) -> dict:
           <ofd:FillColor Value="128 0 0" ColorSpace="5"/>
           <ofd:StrokeColor Value="128 0 0" ColorSpace="5"/>
         </ofd:DrawParam>
+
+    表21 的全部属性都在这里：Relative / Join / LineWidth / DashOffset /
+    DashPattern / Cap / MiterLimit / FillColor / StrokeColor。
+    Relative 的继承由 Document.find_drawparam 负责合并，这里只记录引用。
     """
     info = {
+        "Relative": el.get("Relative"),
         "LineWidth": None,
         "Join": el.get("Join"),
         "Cap": el.get("Cap"),
         "DashPattern": el.get("DashPattern"),
+        "DashOffset": None,
         "MiterLimit": None,
         "FillColor": None,
         "StrokeColor": None,
@@ -610,12 +1072,41 @@ def parse_draw_param(el) -> dict:
     ml = el.get("MiterLimit")
     if ml is not None and str(ml).strip() != "":
         info["MiterLimit"] = X.fnum(ml, None)
+    do = el.get("DashOffset")
+    if do is not None and str(do).strip() != "":
+        info["DashOffset"] = X.fnum(do, None)
     for tag, key in (("FillColor", "FillColor"), ("StrokeColor", "StrokeColor")):
         child = X.find(el, tag)
         if child is not None:
-            info[key] = colorlib.parse_color(
-                child.get("Value"), child.get("ColorSpace"), child.get("Alpha"), None)
+            info[key] = parse_color_el(child, doc, None)
     return info
+
+
+def parse_color_el(el, doc=None, default=None):
+    """解析一个 CT_Color 元素（<FillColor>/<StrokeColor>/BorderColor…）。
+
+    表26：Value 与 Index 二选一；ColorSpace 是资源里的颜色空间 ID，
+    要连同类（GRAY/RGB/CMYK）、BPC、调色板一起解析，否则 BPC≠8 或
+    用了调色板的文件会整片颜色错。
+    """
+    if el is None:
+        return default
+    value = el.get("Value")
+    if value is None:
+        value = el.get("Color")
+        if value is None and (el.text or "").strip():
+            value = el.text
+    cs_id = el.get("ColorSpace")
+    info = doc.find_colorspace(cs_id) if doc is not None else None
+    return colorlib.parse_color(
+        value,
+        (info or {}).get("type") or cs_id,
+        el.get("Alpha"),
+        default,
+        bpc=(info or {}).get("bpc", 8),
+        palette=(info or {}).get("palette"),
+        index=el.get("Index"),
+    )
 
 
 class DocumentRes(object):
@@ -645,7 +1136,7 @@ class DocumentRes(object):
         for dp in X.deepfind_all(root, "DrawParam"):
             did = dp.get("ID") or ""
             if did:
-                self.drawparams[did] = parse_draw_param(dp)
+                self.drawparams[did] = parse_draw_param(dp, self.doc)
 
     def entry_of(self, media_id: str) -> Optional[str]:
         """把 MultiMedia ID 解成包内路径（BaseLoc + MediaFile）。"""
@@ -834,6 +1325,64 @@ class Page(object):
         self._size_cache = size
         return size
 
+    def _area_box(self, name: str):
+        """读页面 Area 下的某个区域（表 7）。没有就返回 None。"""
+        if self.content_root is None:
+            return None
+        area = X.find(self.content_root, "Area")
+        if area is None:
+            return None
+        box = X.find(area, name)
+        if box is None or not (box.text or "").strip():
+            return None
+        vals = X.fnum_list(box.text)
+        if len(vals) < 4:
+            return None
+        return geo.Rect(vals[0], vals[1], vals[2], vals[3]).normalized()
+
+    def physical_box(self):
+        return self._area_box("PhysicalBox") or self.size()
+
+    def application_box(self):
+        """表 7：显示区域，页面内容实际显示或打印输出的区域。
+
+        位于物理区域内；不完全在物理区内时，**物理区外的部分忽略**
+        （即有效显示区 = ApplicationBox ∩ PhysicalBox）；完全在外则整页空白。
+        """
+        return self._area_box("ApplicationBox")
+
+    def content_box(self):
+        """表 7：版心区域，正文区域，位于显示区域内。
+
+        例外同上：与显示区求交；完全在外则版心内容不绘制。
+        """
+        return self._area_box("ContentBox")
+
+    def bleed_box(self):
+        """表 7：出血区域，位于物理区域外；不出现时默认等于物理区。"""
+        return self._area_box("BleedBox")
+
+    def show_box(self):
+        """实际用于显示的矩形（三段求交），返回 (rect, blank)。
+
+        blank=True 表示完全落在物理区外，整页应画成空白。
+        """
+        phys = self.physical_box()
+        cur = phys
+        for getter in (self.application_box, self.content_box):
+            b = getter()
+            if b is None:
+                continue
+            # Rect 没有内置交集，手算（几何库里只有 union/contains/intersects_box）
+            x0 = max(cur.x, b.x)
+            y0 = max(cur.y, b.y)
+            x1 = min(cur.x + cur.w, b.x + b.w)
+            y1 = min(cur.y + cur.h, b.y + b.h)
+            if x1 <= x0 or y1 <= y0:
+                return phys, True      # 完全不相交 → 整页空白
+            cur = geo.Rect(x0, y0, x1 - x0, y1 - y0)
+        return cur, False
+
     def set_size(self, rect: geo.Rect) -> None:
         if self.content_root is None:
             return
@@ -855,12 +1404,20 @@ class Page(object):
         self.element.set("Rotation", str(int(deg) % 360))
         self.doc.pkg.touch(self.doc.entry)
 
-    def all_layers(self) -> List["Layer"]:
+    def all_layers(self, for_print: bool = False) -> List["Layer"]:
         """按绘制顺序的完整图层列表。
 
         背景模板 → 本页图层 → 前景模板 → 注释。
         第15章把注释定义为"版式文档形成后附加的图文信息"，所以叠在最上面；
         签章（Stamp）就在这一层，漏掉它页面就少个章。
+
+        表 61 的两个开关要看清作用对象：
+          · Visible —— **注释对象**是否显示，默认 true → 控制整个 Appearance
+          · Print   —— 对象的 **Remark 信息**是否随页面打印，默认 true
+                        → 只管说明文字，**不影响 Appearance**
+        本项目不渲染 Remark（它是注释说明，不属于页面内容），
+        所以 Appearance 永远按 Visible 决定，不能因为 Print=false 跳过。
+        for_print 保留给将来渲染 Remark 时用。
         """
         bg: List["Layer"] = []
         fg: List["Layer"] = []
@@ -872,6 +1429,7 @@ class Page(object):
             (fg if z.startswith("fore") else bg).extend(tpl.layers)
         layers = bg + list(self.layers) + fg
         for anno in self.annotations:
+            # 只看 Visible：Print 管的是 Remark 文本，与外观无关（表 61）
             if anno.visible and anno.layer is not None:
                 layers.append(anno.layer)
         return layers
@@ -1124,9 +1682,18 @@ class Layer(object):
         self._build()
 
     def flat_objects(self) -> List["OFDObject"]:
+        """图层里按顺序的对象，**含**GroupObject 的子对象。
+
+        但 CompositeObject 的子对象**不能**在这里展开 —— 它的内容在
+        ResourceID 指向的矢量图像里，且要以自己的 Boundary 为原点、按时
+        自己的 Width/Height 裁剪。这些都要靠 scene._emit_object 处理；
+        在这里提前拍平会让同一份内容被画两遍（一份没偏移、一份偏移过）。
+        """
         out = []
         for o in self._objects:
             out.append(o)
+            if isinstance(o, CompositeObject):
+                continue
             out.extend(o.children())
         return out
 
@@ -1212,10 +1779,19 @@ class OFDObject(object):
         return default if val is None else val
 
     # ---------------------------------------------------------- 颜色
+    def _cs_of(self, cs_id):
+        """颜色空间属性是资源 ID（8.3.1），回资源里查 Type/BPC/调色板。"""
+        return self.page.doc.find_colorspace(cs_id) if cs_id not in (None, "") else None
+
     def _color_attr(self, attr: str, cs_attr: str, default=None):
         raw = self.element.get(attr)
         cs = self.element.get(cs_attr) or self.element.get("ColorSpace")
-        return colorlib.parse_color(raw, cs, self.element.get("Alpha"), default)
+        info = self._cs_of(cs)
+        return colorlib.parse_color(
+            raw, (info or {}).get("type") or cs, self.element.get("Alpha"), default,
+            bpc=(info or {}).get("bpc", 8),
+            palette=(info or {}).get("palette"),
+            index=self.element.get("Index"))
 
     def _color_child(self, child_name: str):
         """颜色也可能写成子元素：<ofd:FillColor Value="128 0 0" ColorSpace="5"/>
@@ -1225,11 +1801,7 @@ class OFDObject(object):
         el = X.find(self.element, child_name)
         if el is None:
             return None
-        value = el.get("Value")
-        if value is None:
-            value = el.get("Color") or (el.text or "")
-        return colorlib.parse_color(value, el.get("ColorSpace"),
-                                    el.get("Alpha"), None)
+        return parse_color_el(el, self.page.doc, None)
 
     def has_fill(self) -> bool:
         """是否填充。默认值按对象类型区分（表35 / 表45）。"""
@@ -1255,6 +1827,31 @@ class OFDObject(object):
             return True
         return self.STROKE_DEFAULT
 
+    def fill_shading(self):
+        """FillColor 里装的是渐变/底纹时返回 Shading，否则 None。
+
+        8.3.4：渐变被当作"颜色的一种"，写在 <FillColor> 容器里，
+        与基本颜色互斥（CT_Color 是 xs:choice）。
+        """
+        node = X.find(self.element, "FillColor")
+        if node is None:
+            return None
+        for kind in Shading.KINDS:
+            sub = X.find(node, kind)
+            if sub is not None:
+                return Shading(kind, sub, self.page.doc)
+        return None
+
+    def stroke_shading(self):
+        node = X.find(self.element, "StrokeColor")
+        if node is None:
+            return None
+        for kind in Shading.KINDS:
+            sub = X.find(node, kind)
+            if sub is not None:
+                return Shading(kind, sub, self.page.doc)
+        return None
+
     def fill_color(self):
         c = self._color_child("FillColor")
         if c is not None:
@@ -1275,17 +1872,53 @@ class OFDObject(object):
         return self._color_attr("StrokeColor", "StrokeColorSpace", (0, 0, 0, 1))
 
     def line_width(self) -> float:
+        # 表 21：LineWidth 默认值为 0.353mm（不是 0.35）
         w = self.element.get("LineWidth")
         if w is not None and str(w).strip() != "":
-            return X.fnum(w, 0.35)
+            return X.fnum(w, 0.353)
         dp = self._dp("LineWidth")
-        return float(dp) if dp is not None else 0.35
+        return float(dp) if dp is not None else 0.353
 
     def line_join(self) -> str:
-        return (self.element.get("Join") or self._dp("Join") or "round").lower()
+        """表 21：Join 可取 Miter / Round / Bevel，**默认值为 Miter**。
+
+        绘制参数的"就近原则"（表 21 下方正文）：
+          图元自身属性 > 图元引用的 DrawParam > 所在图层的 DrawParam > 默认值
+        layer 的 DrawParam 在 draw_param() 里已经兜住，这里只管前两层 + 默认值。
+        """
+        return (self.element.get("Join") or self._dp("Join") or "miter").lower()
+
+    def miter_limit(self):
+        """8.2.3：Join 为 Miter 时小角度结合点长度的截断值。
+
+        默认值取 **3.528**，跟标准正文（表21 明文「默认值为3.528」）。
+        附录 A 的 Page.xsd 写的是 4.234，与正文冲突，属标准自身缺陷；
+        业界先例也不统一：PDF 默认 10、SVG 默认 4。
+        旁证：WPS 的 kufeofddom.dll 里有 3.5f 常量，与 3.528 吻合，
+        而 4.234 在业界找不到对应，故按正文。
+        仅当 Join=Miter 时生效（标准明文），其它联接样式下后端会忽略。
+        """
+        v = self.element.get("MiterLimit")
+        if v not in (None, ""):
+            return X.fnum(v, 3.528)
+        # 也可能来自 DrawParam 引用的绘制参数
+        for name in ("MiterLimit",):
+            got = self._dp(name) if hasattr(self, "_dp") else None
+            if got is not None:
+                return float(got)
+        return 3.528
 
     def line_cap(self) -> str:
-        return (self.element.get("Cap") or self._dp("Cap") or "round").lower()
+        """表 21：Cap 可取 Butt / Round / Square，**默认值为 Butt**。"""
+        return (self.element.get("Cap") or self._dp("Cap") or "butt").lower()
+
+    def dash_offset(self) -> float:
+        """8.2.4：虚线起始偏移。DashPattern 不出现时该参数无效。"""
+        v = self.element.get("DashOffset")
+        if v not in (None, ""):
+            return X.fnum(v, 0.0)
+        dv = self._dp("DashOffset")
+        return float(dv) if dv is not None else 0.0
 
     def dash_pattern(self):
         dp_raw = self.element.get("DashPattern")
@@ -1298,6 +1931,81 @@ class OFDObject(object):
         if not vals or all(v <= 0 for v in vals):
             return None
         return vals
+
+    # ---------------------------------------------------------- 裁剪区（8.4 + 表33/34）
+
+    def actions(self):
+        """图元对象的动作序列（14 章 / CT_Action，写在 CT_GraphicUnit 的 Actions 里）。
+
+        返回 [{event, kind, ...}]，空列表表示没有动作。
+        本项目只解析不执行交互——网页端可以据此显示可点击区域。
+        """
+        node = X.find(self.element, "Actions")
+        if node is None:
+            return []
+        return [self.page.doc._action_desc(a) for a in X.find_all(node, "Action")]
+
+    def clips(self):
+        """返回裁剪区列表。空列表表示不裁剪。
+
+        GB/T 33190-2016 的两层组合规则（不是一回事，别混）：
+
+          · 表34：`Clips` 下有多个 `Clip` 对象 → 最终裁剪区是**交集**；
+          · 表33：一个 `Clip` 下可有多个 `Area`（Path 或 Text）→ 是**并集**；
+          · 8.1.4：裁剪区数据以**所修饰图元对象的外接矩形左上角**为原点。
+
+        因此返回结构是「组」的列表：外层每个元素是一个 Clip（组间取交集），
+        组内是若干子路径（组内取并集）。
+        """
+        node = X.find(self.element, "Clips")
+        if node is None:
+            return []
+        groups = []
+        for clip in X.find_all(node, "Clip"):
+            # 表 33：Clip 自带的 CTM「针对对象坐标系，对 Area 下包含的 Path 和 Text
+            # 进行进一步的变换」——必须叠加，否则带变换的裁剪区会裁错位置。
+            cm_raw = clip.get("CTM")
+            ccm = None
+            if cm_raw:
+                v = X.fnum_list(cm_raw)
+                if len(v) >= 6:
+                    ccm = (v[0], v[1], v[2], v[3], v[4], v[5])
+            subs = []
+            for area in list(clip):
+                # Area 下二选一：Path 或 Text（schema 里是 xs:choice）
+                path_el = X.find(area, "Path")
+                if path_el is not None:
+                    # 路径数据可能在 <AbbreviatedData> 子元素，也可能是 Path/@Data，
+                    # 两种写法都认（与 PathObject 的读取逻辑一致）
+                    data = ""
+                    ab = X.find(path_el, "AbbreviatedData")
+                    if ab is not None and (ab.text or "").strip():
+                        data = ab.text.strip()
+                    elif path_el.get("Data"):
+                        data = path_el.get("Data").strip()
+                    if data:
+                        # 裁剪区里的 Path 是完整图形对象，自带 Boundary（必选）。
+                        # 它的 AbbreviatedData 相对自己的 Boundary 左上角，
+                        # 所以要加上这个偏移才能落到对象空间。
+                        ob = X.fnum_list(path_el.get("Boundary") or "")
+                        ox = ob[0] if len(ob) >= 4 else 0.0
+                        oy = ob[1] if len(ob) >= 4 else 0.0
+                        for arr in _abbrev_to_subpaths(data):
+                            subs.append([arr[k] + ox if k % 2 == 0 else arr[k] + oy
+                                         for k in range(len(arr))])
+                text_el = X.find(area, "Text")
+                if text_el is not None:
+                    box = text_el.get("Boundary")
+                    if box:
+                        b = X.fnum_list(box)
+                        if len(b) >= 4:
+                            # 文字裁剪区按它的外接矩形近似（标准允许 Text 作裁剪区，
+                            # 精确做法要按字形轮廓，这里退化为矩形，够用且不会错到别处）
+                            subs.append([b[0], b[1], b[0] + b[2], b[1],
+                                         b[0] + b[2], b[1] + b[3], b[0], b[1] + b[3]])
+            if subs:
+                groups.append((ccm, subs))
+        return groups
 
     # ---------------------------------------------------------- 命中
     def hit_test(self, x: float, y: float, mode: str = "box", tol: float = 0.6) -> bool:
@@ -1359,6 +2067,14 @@ class TextObject(OFDObject):
     def set_size_mm(self, v: float) -> None:
         self.element.set("Size", geo._fmt(v))
         self.page.doc.pkg.touch(self.page.content_entry)
+
+    def weight(self) -> int:
+        """表 45 的 Weight：100~900，默认 400。只认这几个档位。"""
+        v = int(X.fnum(self.element.get("Weight"), 400))
+        if v not in (100, 200, 300, 400, 500, 600, 700, 800, 900):
+            # 非标准值按最近的 100 取整；<100 或 >900 夹到边界
+            v = max(100, min(900, int(round(v / 100.0)) * 100))
+        return v
 
     def bold(self) -> bool:
         return X.bool_attr(self.element.get("Weight"), False) or int(X.fnum(self.element.get("Weight"), 0)) >= 600
@@ -1430,6 +2146,42 @@ class TextObject(OFDObject):
             t = t[:24] + "…"
         return "文本 #%s  %s" % (self.id, t)
 
+    # ---------------------------------------------------------- 字形变换（11.4）
+
+    def cg_transforms(self):
+        """字形变换（11.4 / 表48）。
+
+        `CGTransform` 与 `TextCode` 是 `CT_Text` 下**并列**的子元素，不是嵌在
+        TextCode 里；`CodePosition` 指向 TextCode 里字符的起始位置，所以一个
+        TextObject 可以有多个 CGTransform，分别对应不同的 TextCode。
+
+        返回 [{code_position, code_count, glyph_count, glyphs}]，按 CodePosition 排序。
+        """
+        out = []
+        for el in X.find_all(self.element, "CGTransform"):
+            # 附录 A：Glyphs 是子元素（ST_Array），不是属性。
+            # 表48 说它"必选"、schema 却是 minOccurs=0 —— 标准自相矛盾，
+            # 这里按"有就解析、没有就跳过"处理。
+            gel = X.find(el, "Glyphs")
+            raw = (gel.text if gel is not None else None) or el.get("Glyphs") or ""
+            glyphs = X.fnum_list(raw)
+            if not glyphs:
+                continue
+            out.append({
+                "code_position": int(X.fnum(el.get("CodePosition"), 0)),
+                "code_count": max(1, int(X.fnum(el.get("CodeCount"), 1))),
+                "glyph_count": max(1, int(X.fnum(el.get("GlyphCount"), 1))),
+                "glyphs": [int(g) for g in glyphs],
+            })
+        out.sort(key=lambda d: d["code_position"])
+        return out
+
+    def has_nonuniform_glyphs(self) -> bool:
+        """是否存在"字符数≠字形数"的变换（多对一 / 一对多 / 多对多）。"""
+        for t in self.cg_transforms():
+            if t["code_count"] != t["glyph_count"] or len(t["glyphs"]) != t["code_count"]:
+                return True
+        return False
 
 class TextCode(object):
     __slots__ = ("element",)
@@ -1514,6 +2266,11 @@ class PathObject(OFDObject):
     def subpaths(self, with_ctm: bool = False) -> List[geo.SubPath]:
         data = self.path_data()
         m = self.world_matrix() if with_ctm else None
+        if not data:
+            # 标准里非紧缩描述（表37-42）只用于区域；有的导出器把它写在
+            # PathObject 下，读得动就读（写回仍按标准输出 AbbreviatedData）
+            sp = geo.parse_area(self.element, m)
+            return [sp] if sp is not None else []
         return geo.parse_path_data(data, m)
 
     def is_closed_fillable(self) -> bool:
@@ -1546,10 +2303,26 @@ class ImageObject(OFDObject):
     TYPE = "图片"
 
     def resource_id(self) -> str:
-        return self.element.get("ResourceID") or ""
+        # 表 43 的拼写就是 ResouceID（少一个 r），两种都认
+        return (self.element.get("ResourceID")
+                or self.element.get("ResouceID") or "")
+
+    def substitution_id(self) -> str:
+        """表 43：可替换图像，高分辨率输出时用它替换主图。"""
+        return self.element.get("Substitution") or ""
+
+    def mask_id(self) -> str:
+        """表 43：图像蒙版，应与主图同大小的二值图。"""
+        return self.element.get("ImageMask") or ""
 
     def image_bytes(self) -> Optional[Tuple[str, bytes]]:
         return self.page.doc.find_image(self.resource_id())
+
+    def image_bytes_of(self, media_id: str) -> Optional[Tuple[str, bytes]]:
+        """按多媒体资源 ID 取图片字节（给 Substitution / ImageMask 用）。"""
+        if not media_id:
+            return None
+        return self.page.doc.find_image(media_id)
 
     def _hit_local(self, lx: float, ly: float, tol: float) -> bool:
         return self.boundary().normalized().contains(lx, ly, tol)
@@ -1558,14 +2331,76 @@ class ImageObject(OFDObject):
         got = self.image_bytes()
         return "图片 #%s  %s" % (self.id, got[0] if got else "资源缺失")
 
+    def image_border(self):
+        """图像边框（表43 的 Border 子元素）。
+
+        返回 None 表示不画边框。字段：
+            line_width  线宽 mm，**为 0 表示不绘制边框**（表43 明确写了）
+            radius_h / radius_v  水平 / 垂直角半径（标准拼写 HorizonalCornerRadius 少个 z）
+            dash / dash_offset   边框虚线；起点在左上角、绕行方向顺时针
+            color       边框颜色，默认黑色
+        """
+        node = X.find(self.element, "Border")
+        if node is None:
+            return None
+        lw = node.get("LineWidth")
+        width = X.fnum(lw, 0.353) if lw not in (None, "") else 0.353
+        if width <= 0:
+            return None                      # 表43：0 表示不绘制
+        color = (0, 0, 0, 1)
+        cel = X.find(node, "BorderColor")
+        if cel is not None:
+            color = parse_color_el(cel, self.page.doc, (0, 0, 0, 1)) or color
+        dp = node.get("DashPattern")
+        dash = X.fnum_list(dp) if dp and dp != "0" else None
+        if dash and all(v <= 0 for v in dash):
+            dash = None
+        return {
+            "w": width,
+            "radius_h": X.fnum(node.get("HorizonalCornerRadius"), 0.0),
+            "radius_v": X.fnum(node.get("VerticalCornerRadius"), 0.0),
+            "dash": dash,
+            "dash_offset": X.fnum(node.get("DashOffset"), 0.0),
+            "color": color,
+        }
+
 
 @register_object("CompositeObject")
+
 class CompositeObject(OFDObject):
     """组合对象：内部再挂若干对象，可能有自己的 CTM。"""
 
     TYPE = "组合"
 
+    def resource_id(self) -> str:
+        """表 49：复合对象的内容在 ResourceID 指向的矢量图像资源里。"""
+        return (self.element.get("ResourceID")
+                or self.element.get("ResouceID") or "")
+
+    def vector_g(self):
+        vid = self.resource_id()
+        if not vid:
+            return None
+        return self.page.doc.find_vectorg(vid)
+
+    def content_objects(self) -> List["OFDObject"]:
+        """把矢量图像资源里的 Content（CT_PageBlock）展开成对象列表。"""
+        vg = self.vector_g()
+        if not vg or vg.get("content") is None:
+            return []
+        out = []
+        for ch in list(vg["content"]):
+            cls = _OBJ_TYPES.get(X.local(ch.tag))
+            if cls is not None:
+                out.append(cls(self.page, ch, self.layer))
+        return out
+
     def children(self) -> List["OFDObject"]:
+        # 优先用 ResourceID 指向的矢量图像内容（第 13 章的正规定义）；
+        # 没有 ResourceID 时才退回把 XML 子元素当内容（兼容非标准写法）。
+        via_res = self.content_objects()
+        if via_res:
+            return via_res
         out = []
         for ch in list(self.element):
             cls = _OBJ_TYPES.get(X.local(ch.tag))

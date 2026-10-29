@@ -35,3 +35,12 @@ desktop.ini
 *.log
 *.pid
 .cdp-profile*/
+
+# 用户指定的标准原件（版权，不入库）
+docs/33190-2016-gbt-cd-300.pdf
+docs/33190-2016-gbt-cd-300.txt
+
+# 自带依赖的生成产物（用 tools/vendor_deps.py 重建）
+vendor/
+ofdlite/rustcore/target/
+ofdlite/rustcore/Cargo.lock

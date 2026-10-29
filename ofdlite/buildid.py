@@ -54,12 +54,23 @@ def build_id(short: int = 12) -> str:
     return "%s+g%s" % (__version__, source_digest()[:short])
 
 
+def _kernel_line() -> str:
+    """渲染内核状态行。没装 Rust 内核时如实说明走纯 Python，不隐藏。"""
+    try:
+        from ofdlite import _fast
+        ok, msg = _fast.status()
+        return "渲染内核 %s\n" % msg
+    except Exception:
+        return ""
+
+
 def banner() -> str:
     """给 --version / 关于框用的三行。"""
     from ofdlite import __version__
     return (
         "小黄OFD %s\n" % __version__
         + "BUILD_ID %s\n" % build_id()
+        + _kernel_line()
         + "Copyright (c) 2026 小黄 <15359927763> QQ 1924053793\n"
         + "本软件许可禁止删除或替换作者署名后以其他名义发布（见 LICENSE）"
     )

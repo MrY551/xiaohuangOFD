@@ -37,75 +37,150 @@ def _norm_space(cs) -> str:
     if cs is None:
         return "rgb"
     s = str(cs).strip()
+    low = s.lower()
+    if low in _STD_SPACES:
+        return _STD_SPACES[low]
     if s in _STD_SPACES:
         return _STD_SPACES[s]
     return "rgb"
 
 
-def parse_color(value, space=None, alpha=None, default=None) -> Optional[RGBA]:
-    """把 (value, space, alpha) 转成 RGBA 0..1。解析不出返回 default。"""
-    if value is None or value == "":
-        return default
-    s = str(value).strip()
+def channel_scale(bpc) -> float:
+    """表27：通道取值范围是 [0, 2^BPC-1]，BPC 默认 8。"""
+    try:
+        n = int(bpc)
+    except (TypeError, ValueError):
+        n = 8
+    if n < 1 or n > 16:
+        n = 8
+    return float((1 << n) - 1)
 
-    rgb = None
-    if s.startswith("#"):
-        h = s[1:].strip()
+
+def parse_color(value, space=None, alpha=None, default=None,
+                bpc=8, palette=None, index=None) -> Optional[RGBA]:
+    """把 (value, space, alpha) 转成 RGBA 0..1。解析不出返回 default。
+
+    参数按标准第 8.3 章：
+      space   颜色空间类型，取 GRAY / RGB / CMYK（也接受资源 ID 解析后的类型名）
+      bpc     表25 BitsPerComponent（1/2/4/8/16，默认 8），决定通道上限 2^BPC-1
+      palette 表25 调色板（CV 列表），配合 index 使用
+      index   表26 的 Index，Value 不出现时按调色板取色
+
+    通道三个写法都要认（表27 的示例就是这么写的）：
+      "#11 #22 #33"  逐通道十六进制
+      "#FF0000"      整串十六进制（工具届惯例，标准没写但真实文件常见）
+      "173 51 68"    十进制
+    """
+    s = "" if value is None else str(value).strip()
+    kind = _norm_space(space)
+    ch = None                                   # 未归一化的通道值
+
+    # 表26：Value 不出现时用 Index 从调色板取值
+    if not s:
         try:
-            if len(h) == 3:
-                r, g, b = (int(c * 2, 16) for c in h)
-            elif len(h) == 6:
-                r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
-            elif len(h) == 8:
-                r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:4 + 2], 16)
-            else:
-                return default
-            rgb = (r, g, b)
-        except ValueError:
+            ix = int(index) if index not in (None, "") else None
+        except (TypeError, ValueError):
+            ix = None
+        if ix is None or not palette or ix < 0 or ix >= len(palette):
             return default
+        ch = [float(v) for v in palette[ix]]
+        if not ch:
+            return default
+    elif s.startswith("#"):
+        toks = s.split()
+        if len(toks) >= 2 and all(t.startswith("#") for t in toks):
+            try:
+                ch = [int(t[1:], 16) for t in toks]
+            except ValueError:
+                return default
+        else:
+            h = s[1:].strip()
+            try:
+                if len(h) == 1:                 # "#F" → 单通道满值
+                    ch = [int(h * 2, 16)]
+                elif len(h) == 2:               # 表27 的 GRAY 写法 "#FF"
+                    ch = [int(h, 16)]
+                elif len(h) == 3:
+                    rgb = tuple(int(c * 2, 16) for c in h)
+                elif len(h) == 6:
+                    rgb = (int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16))
+                elif len(h) == 8:
+                    rgb = (int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16))
+                else:
+                    return default
+            except ValueError:
+                return default
+            if ch is None:
+                ch = list(rgb)
     elif s.lower() in NAMED:
-        rgb = NAMED[s.lower()]
+        ch = list(NAMED[s.lower()])
     elif re.match(r"^\d+\s+\d+\s+\d+(\s+\d+)?$", s) or "," in s:
         parts = [p for p in re.split(r"[,\s]+", s) if p != ""]
         try:
-            vals = [float(p) for p in parts]
+            ch = [float(p) for p in parts]
         except ValueError:
-            return default
-        sp = _norm_space(space)
-        if sp == "cmyk" and len(vals) >= 4:
-            c, m, y, k = [v / 255.0 if v > 1 else v for v in vals[:4]]
-            r = 255 * (1 - c) * (1 - k)
-            g = 255 * (1 - m) * (1 - k)
-            b = 255 * (1 - y) * (1 - k)
-            rgb = (r, g, b)
-        elif sp == "gray" and len(vals) >= 1:
-            v = vals[0]
-            v = v if v <= 1 else v / 255.0
-            rgb = (v * 255, v * 255, v * 255)
-        elif len(vals) >= 3:
-            rgb = tuple(vals[:3])
-        elif len(vals) == 1:
-            v = vals[0]
-            v = v if v <= 1 else v / 255.0
-            rgb = (v * 255, v * 255, v * 255)
-        else:
             return default
     elif re.match(r"^-?\d+(\.\d+)?$", s):
         try:
-            v = float(s)
+            ch = [float(s)]
         except ValueError:
             return default
-        v = v if v <= 1 else v / 255.0
-        rgb = (v * 255, v * 255, v * 255)
     else:
         return default
 
+    # 通道数决定颜色空间（表27：Gray 1 个、RGB 3 个、CMYK 4 个）。
+    # 标准若同时给了 Type，按 Type；Type 与通道数打架时以通道数为准。
+    if len(ch) == 1:
+        kind = "gray"
+    elif len(ch) == 4:
+        kind = "cmyk"
+    elif len(ch) == 3:
+        kind = "rgb"
+
+    scale = channel_scale(bpc)
+    # 0..1 的小数写法是工具届惯例（标准要求整数）。只在 BPC=8、全部 ≤1 时采用，
+    # 与旧行为一致，避免把真实的 0/1 通道值误判。
+    fractional = scale == 255.0 and all(v <= 1.0 for v in ch)
+
+    def unit(v):
+        if fractional:
+            return float(v)
+        return float(v) / scale
+
+    # 表27：通道值超出 [0, 2^BPC-1] 时按默认颜色处理
+    if not fractional:
+        for v in ch:
+            if v < 0 or v > scale:
+                return default
+
+    if kind == "cmyk":
+        if len(ch) < 4:
+            return default
+        c, m, y, k = [unit(v) for v in ch[:4]]
+        rgb = (255 * (1 - c) * (1 - k),
+               255 * (1 - m) * (1 - k),
+               255 * (1 - y) * (1 - k))
+    elif kind == "gray":
+        v = unit(ch[0])
+        rgb = (v * 255, v * 255, v * 255)
+    else:
+        if len(ch) < 3:
+            return default
+        rgb = tuple(unit(v) * 255.0 for v in ch[:3])
+
     r, g, b = [max(0.0, min(255.0, float(c))) for c in rgb]
+
+    # 表26：Alpha 是 0~255 的整数，255 完全不透明（BPC 不参与）。
+    # 带小数点的写法按 0..1 处理，兼容工具惯用写法。
     a = 1.0
     if alpha is not None and alpha != "":
         try:
-            av = float(alpha)
-            a = av if av <= 1.0 else av / 255.0
+            raw = str(alpha).strip()
+            av = float(raw)
+            if "." in raw:
+                a = av
+            else:
+                a = av / 255.0
             a = max(0.0, min(1.0, a))
         except ValueError:
             a = 1.0

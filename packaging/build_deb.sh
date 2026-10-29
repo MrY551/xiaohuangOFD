@@ -30,6 +30,13 @@ mkdir -p "$DIST"
 
 # ---------------------------------------------------------------- 程序文件
 cp -r "$ROOT/ofdlite" "$PKGROOT/usr/lib/xiaohuang-ofd/"
+# 自带依赖：Pillow / pycairo 及其 .so。没有就先跑 tools/vendor_deps.py 生成。
+if [ -d "$ROOT/vendor" ]; then
+    cp -r "$ROOT/vendor" "$PKGROOT/usr/lib/xiaohuang-ofd/"
+    echo "  自带依赖: $(du -sh "$ROOT/vendor" | cut -f1)"
+else
+    echo "  警告: vendor/ 不存在，包将依赖系统的 python3-pil" >&2
+fi
 cp -r "$ROOT/app" "$PKGROOT/usr/lib/xiaohuang-ofd/"
 cp -r "$ROOT/web" "$PKGROOT/usr/lib/xiaohuang-ofd/"
 cp -r "$ROOT/tools" "$PKGROOT/usr/lib/xiaohuang-ofd/"
@@ -84,7 +91,16 @@ rm -rf "$PKGROOT/usr/lib/xiaohuang-ofd/web/__pycache__"
 cat > "$PKGROOT/usr/bin/ofd-editor" <<'LAUNCHER'
 #!/bin/sh
 # OFD 桌面端启动器
-export PYTHONPATH=/usr/lib/xiaohuang-ofd${PYTHONPATH:+:$PYTHONPATH}
+# 自带依赖优先：vendor/python 放最前面，vendor/lib 只放我们收集的库
+VENDOR=/usr/lib/xiaohuang-ofd/vendor
+if [ -d "$VENDOR/python" ]; then
+    export PYTHONPATH=$VENDOR/python:/usr/lib/xiaohuang-ofd${PYTHONPATH:+:$PYTHONPATH}
+    if [ -d "$VENDOR/lib" ]; then
+        export LD_LIBRARY_PATH=$VENDOR/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
+    fi
+else
+    export PYTHONPATH=/usr/lib/xiaohuang-ofd${PYTHONPATH:+:$PYTHONPATH}
+fi
 exec python3 -m app.main "$@"
 LAUNCHER
 chmod 0755 "$PKGROOT/usr/bin/ofd-editor"
@@ -92,14 +108,32 @@ chmod 0755 "$PKGROOT/usr/bin/ofd-editor"
 cat > "$PKGROOT/usr/bin/ofd-web" <<'LAUNCHER'
 #!/bin/sh
 # OFD 网页端启动器。默认 127.0.0.1:8760，加 --host 0.0.0.0 才对外。
-export PYTHONPATH=/usr/lib/xiaohuang-ofd${PYTHONPATH:+:$PYTHONPATH}
+# 自带依赖优先：vendor/python 放最前面，vendor/lib 只放我们收集的库
+VENDOR=/usr/lib/xiaohuang-ofd/vendor
+if [ -d "$VENDOR/python" ]; then
+    export PYTHONPATH=$VENDOR/python:/usr/lib/xiaohuang-ofd${PYTHONPATH:+:$PYTHONPATH}
+    if [ -d "$VENDOR/lib" ]; then
+        export LD_LIBRARY_PATH=$VENDOR/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
+    fi
+else
+    export PYTHONPATH=/usr/lib/xiaohuang-ofd${PYTHONPATH:+:$PYTHONPATH}
+fi
 exec python3 /usr/lib/xiaohuang-ofd/web/server.py "$@"
 LAUNCHER
 chmod 0755 "$PKGROOT/usr/bin/ofd-web"
 
 cat > "$PKGROOT/usr/bin/ofd-cli" <<'LAUNCHER'
 #!/bin/sh
-export PYTHONPATH=/usr/lib/xiaohuang-ofd${PYTHONPATH:+:$PYTHONPATH}
+# 自带依赖优先：vendor/python 放最前面，vendor/lib 只放我们收集的库
+VENDOR=/usr/lib/xiaohuang-ofd/vendor
+if [ -d "$VENDOR/python" ]; then
+    export PYTHONPATH=$VENDOR/python:/usr/lib/xiaohuang-ofd${PYTHONPATH:+:$PYTHONPATH}
+    if [ -d "$VENDOR/lib" ]; then
+        export LD_LIBRARY_PATH=$VENDOR/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
+    fi
+else
+    export PYTHONPATH=/usr/lib/xiaohuang-ofd${PYTHONPATH:+:$PYTHONPATH}
+fi
 exec python3 /usr/lib/xiaohuang-ofd/tools/ofd_cli.py "$@"
 LAUNCHER
 chmod 0755 "$PKGROOT/usr/bin/ofd-cli"
@@ -196,7 +230,7 @@ Architecture: $ARCH
 Installed-Size: $INSTALLED_SIZE
 Maintainer: Xiao Huang OFD <1924053793@qq.com>
 Homepage: https://github.com/MrY551/xiaohuangOFD
-Depends: python3 (>= 3.7), python3-pil, cups-client
+Depends: python3 (>= 3.7), cups-client
 Recommends: python3-pyside6.qtcore | python3-pyside2.qtcore | python3-pyqt5, fonts-noto-cjk
 Suggests: ghostscript
 Description: 小黄OFD - OFD 版式文档阅读、编辑与打印工具

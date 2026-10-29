@@ -50,10 +50,13 @@ def parse_ranges(text: str, total: int):
 
 
 class PrintDialog(QDialog):
-    def __init__(self, pkg: model.OFDPackage, page_index: int = 0, parent=None):
+    def __init__(self, pkg: model.OFDPackage, page_index: int = 0, parent=None,
+                 copies_limit=None):
         super().__init__(parent)
         self.pkg = pkg
         self.page_index = page_index
+        # 表8 Copies：None=不限，0=禁打（调用方已挡），正数=上限
+        self.copies_limit = copies_limit
         self.setWindowTitle("打印")
         self.resize(520, 460)
         self._result_pdf = None
@@ -82,6 +85,11 @@ class PrintDialog(QDialog):
         self.copies = QSpinBox()
         self.copies.setRange(1, 99)
         self.copies.setValue(1)
+        if self.copies_limit:
+            # 表8：Copies 就是份数上限，别让用户在对话框里选一个会被拒的值
+            self.copies.setMaximum(max(1, int(self.copies_limit)))
+            self.copies.setToolTip("文档权限声明限定最多打印 %d 份（表8 Copies）"
+                                   % self.copies_limit)
         form.addRow("份数", self.copies)
 
         self.nup = QComboBox()

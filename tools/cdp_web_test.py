@@ -292,17 +292,27 @@ def main(argv=None):
                 const cv = document.getElementById('cv');
                 const rect = cv.getBoundingClientRect();
                 const Z = 96 / 25.4 * o.state.zoom;
-                const sx = rect.left + (obj.corners[0][0] + 1) * Z;
-                const sy = rect.top + (obj.corners[0][1] + 1) * Z;
+                // 从对象中心按下：文本对象的外接矩形左上角可能落在字形之外，
+                // 从角上按下会命中不到（命中测试用的是字形/内容框）
+                const cx = (obj.corners[0][0] + obj.corners[2][0]) / 2;
+                const cy = (obj.corners[0][1] + obj.corners[2][1]) / 2;
+                const sx = rect.left + cx * Z;
+                const sy = rect.top + cy * Z;
                 const down = {bubbles: true, clientX: sx, clientY: sy, pointerId: 2,
                               pointerType: 'mouse', button: 0, buttons: 1};
                 cv.dispatchEvent(new PointerEvent('pointerdown', down));
-                const move = Object.assign({}, down, {clientX: sx + 12 * Z, clientY: sy + 6 * Z});
+                const move = Object.assign({}, down, {clientX: sx + 12 * Z, clientY: sy});
                 window.dispatchEvent(new PointerEvent('pointermove', move));
                 await new Promise(r => setTimeout(r, 40));
                 window.dispatchEvent(new PointerEvent('pointerup', move));
-                await new Promise(r => setTimeout(r, 600));
-                const after = o.state.page.objects.find(x => x.id === obj.id);
+                // 服务端编辑 + 重新载入是异步的，冷启动时可能超过 600ms：
+                // 轮询等它落位，别用固定 sleep 判失败
+                let after = null;
+                for (let i = 0; i < 60; i++) {
+                  await new Promise(r => setTimeout(r, 100));
+                  const cur = o.state.page.objects.find(x => x.id === obj.id);
+                  if (cur && Math.abs(cur.corners[0][0] - before) > 0.5) { after = cur; break; }
+                }
                 return {before, after: after ? after.corners[0][0] : null,
                         objects: o.state.page.objects.length};
             })()""")

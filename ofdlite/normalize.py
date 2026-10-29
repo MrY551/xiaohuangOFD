@@ -37,9 +37,17 @@ except Exception:          # pragma: no cover
 NS = "http://www.ofdspec.org/2016"
 
 # 附录 A 里各对象的子元素顺序（只列本模块会动的部分）
+#
+# 注意：Actions 与 Clips 属于基类 CT_GraphicUnit 的 sequence，在派生类的元素**之前**。
+# XSD 的 extension 语义是"基类元素在前、派生类元素在后"，把 Clips 写在
+# AbbreviatedData 后面会直接报 "Clips: This element is not expected"。
+CT_GU_UNIT_HEAD = ["Actions", "Clips"]
+
 ORDER_PREFIX = {
-    "PathObject": ["StrokeColor", "FillColor", "AbbreviatedData"],
-    "TextObject": ["FillColor", "StrokeColor", "CGTransform", "TextCode"],
+    "PathObject": CT_GU_UNIT_HEAD + ["StrokeColor", "FillColor", "AbbreviatedData"],
+    "TextObject": CT_GU_UNIT_HEAD + ["FillColor", "StrokeColor", "CGTransform", "TextCode"],
+    "ImageObject": CT_GU_UNIT_HEAD,
+    "CompositeObject": CT_GU_UNIT_HEAD,
 }
 
 COLOR_ATTRS = ("FillColor", "StrokeColor", "ColorSpace",

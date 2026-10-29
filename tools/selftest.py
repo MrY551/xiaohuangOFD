@@ -296,6 +296,144 @@ def main():
         if len(sheets[0]) != 4:
             raise AssertionError("每张纸应有 4 个页位，得到 %d" % len(sheets[0]))
 
+    # ---------------------------------------------------------- 文档级附属结构
+    extras_path = os.path.join(tmpdir, "extras.ofd")
+    sys.path.insert(0, HERE)
+    import make_extras_ofd
+    make_extras_ofd.build(extras_path)
+    epkg = OFDPackage.open(extras_path)
+    edoc = epkg.document
+
+    @check("表3/表8：DocType、权限声明（含 Print 子节点）")
+    def _():
+        if epkg.doc_type != "OFD" or epkg.ofd_version != "1.0":
+            raise AssertionError((epkg.doc_type, epkg.ofd_version))
+        perm = edoc.permissions
+        if perm["Export"] is not False or perm["Printable"] is not False:
+            raise AssertionError(perm)
+        if perm["Copies"] != 2:
+            raise AssertionError(perm)
+        from ofdlite import extras
+        if extras.printable_count(perm) != 0:
+            raise AssertionError("Printable=false 时应为 0 份")
+
+    @check("表9：视图首选项（子元素写法也要认）")
+    def _():
+        pref = edoc.vpreferences
+        if pref["PageMode"] != "UseOutlines" or pref["PageLayout"] != "OnePage":
+            raise AssertionError(pref)
+        if pref["Zoom"] != 120:
+            raise AssertionError(pref)
+
+    @check("表10：书签与 Dest（页面/位置/缩放）")
+    def _():
+        bms = edoc.bookmarks
+        if len(bms) != 2 or bms[0]["name"] != "封面":
+            raise AssertionError(bms)
+        if bms[0]["dest"]["page_id"] != "10" or bms[0]["dest"]["zoom"] != 100:
+            raise AssertionError(bms[0])
+
+    @check("表72/73：附件列表与包内条目解析")
+    def _():
+        atts = edoc.attachments
+        if len(atts) != 2 or atts[0]["id"] != "A1":
+            raise AssertionError(atts)
+        if not epkg.has(atts[0]["entry"]):
+            raise AssertionError(atts[0])
+        if b"A1" not in epkg.read(atts[0]["entry"]):
+            raise AssertionError("附件内容不对")
+
+    @check("表63/64：自定义标引与扩展信息")
+    def _():
+        if not edoc.custom_tags or edoc.custom_tags[0]["namespace"].startswith("http") is False:
+            raise AssertionError(edoc.custom_tags)
+        if not edoc.extensions or edoc.extensions[0]["properties"][0]["name"] != "来源":
+            raise AssertionError(edoc.extensions)
+
+    @check("表66-69：签名列表与签名描述（只解析不验签）")
+    def _():
+        info = edoc.signatures
+        if info.get("max_sign_id") != "s1":
+            raise AssertionError(info)
+        it = info["items"][0]
+        if it["type"] != "Seal" or it["provider"] != "SampleSigner":
+            raise AssertionError(it)
+        if it["datetime"] != "2026-10-30T01:02:03" or it["method"] != "SM3withSM2":
+            raise AssertionError(it)
+        if len(it["references"]) != 2 or it["references"][0]["value"] != "AAAA":
+            raise AssertionError(it["references"])
+        if not it["stamp_annots"] or it["stamp_annots"][0]["page_ref"] != "10":
+            raise AssertionError(it["stamp_annots"])
+        if it["seal"] != "Seal.esl" or it["signed_value"] != "SignedValue.dat":
+            raise AssertionError(it)
+
+    @check("表70/71：版本列表（内嵌 OFD.xml）与版本描述")
+    def _():
+        vers = edoc.versions["items"]
+        if len(vers) != 2 or vers[0]["name"] != "初版":
+            raise AssertionError(vers)
+        if vers[0]["doc_root"] != "/Doc_0/Document.xml":
+            raise AssertionError(vers[0])
+        if edoc.versions["current"] != "v1":
+            raise AssertionError(edoc.versions)
+
+    @check("表51-59：五类动作 + CT_Region（9.3 非紧缩描述）")
+    def _():
+        page = epkg.all_pages()[0]
+        acts = []
+        for o in page.objects():
+            acts.extend(o.actions())
+        kinds = set(a["kind"] for a in acts)
+        for need in ("goto", "uri", "gotoa", "sound", "movie"):
+            if need not in kinds:
+                raise AssertionError(kinds)
+        gotoa = [a for a in acts if a["kind"] == "gotoa"][0]
+        if gotoa["attach_id"] != "A1":
+            raise AssertionError(gotoa)
+        # 模型层给的是对象空间（Boundary 左上角为原点，8.1.4）
+        region = gotoa.get("region") or {}
+        if region.get("bbox") != [0.0, 0.0, 60.0, 20.0]:
+            raise AssertionError("模型层 region 应为对象空间: %r" % (region,))
+        # scene 层必须抬到页面坐标（表51 的启动区域作用在页面上）
+        from ofdlite.scene import build_page_scene
+        op = [o for o in build_page_scene(page).ops if o.get("id") == "42"][0]
+        scene_region = op["actions"][0].get("region") or {}
+        if scene_region.get("bbox") != [20.0, 40.0, 60.0, 20.0]:
+            raise AssertionError("scene 层 region 应为页面坐标: %r" % (scene_region,))
+        goto = [a for a in acts if a["kind"] == "goto"][0]
+        if goto["dest_detail"]["zoom"] != 200 or goto["dest_detail"]["top"] != 6:
+            raise AssertionError(goto)
+
+    @check("表44：FixedWidth 只作替代字型提示，不改排版步进")
+    def _():
+        from ofdlite.scene import build_page_scene
+        page = epkg.all_pages()[0]
+        fs = edoc.find_font("2")
+        if fs is None or not fs.fixed_width:
+            raise AssertionError("字体 2 应带 FixedWidth 标记")
+        sc = build_page_scene(page)
+        texts = [op for op in sc.ops if op.get("t") == "text" and op.get("id") == "41"]
+        if not texts:
+            raise AssertionError("没生成文字指令")
+        # 指令上要带 fixed_width（给渲染端做替代字体偏好），
+        # 但不能因此把字距改成 em——表44 原文写的是"用于匹配替代字型"
+        if not any(op.get("fixed_width") for op in texts):
+            raise AssertionError(texts[0])
+        from ofdlite.scene import _advance
+        if _advance("A", 10.0) >= 10.0:
+            raise AssertionError("普通字符不应按 em 推进")
+
+    @check("第13章：标准拼写的 CompositeGraphicUnit 能展开")
+    def _():
+        sys.path.insert(0, os.path.join(ROOT, "tools"))
+        import std_gap_probe
+        p = std_gap_probe.build_composite_sample(tmpdir)
+        pk = OFDPackage.open(p)
+        page = pk.all_pages()[0]
+        objs = [o for o in page.objects() if type(o).__name__ == "CompositeObject"]
+        if not objs or not objs[0].content_objects():
+            raise AssertionError("复合对象没展开")
+
     print()
     print("通过 %d / %d" % (len(PASS), len(PASS) + len(FAIL)))
     if FAIL:

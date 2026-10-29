@@ -36,6 +36,9 @@
 
     {"type": "image", "path": "logo.png", "x": 20, "y": 160, "w": 30, "h": 30}
 
+    # 任意对象都可加 clip（组间交集、组内并集，坐标相对该对象 Boundary 左上角）：
+    #   {"type": "rect", ..., "clip": [[[10,10,40,10,40,30,10,30], [...]]]}
+
     {"type": "path", "d": "M 0 0 L 40 0 L 40 20 C",
      "x": 20, "y": 200, "w": 40, "h": 20,
      "stroke": "#000000", "stroke_width": 0.3, "fill": null}
@@ -133,9 +136,12 @@ def document_res_xml(images, next_id: int) -> str:
     if images:
         parts.append('  <ofd:MultiMedias>\n')
         for mid, fn in images:
+            # 附录 A：MultiMedia 是 element-only，路径必须写在 <MediaFile> 子元素里，
+            # 直接写成元素内容会被 schema 拒（Missing child element MediaFile）。
             parts.append(
-                '    <ofd:MultiMedia ID="%s" Type="Image" '
-                'Format="PNG" >Res/%s</ofd:MultiMedia>\n' % (mid, escape(fn)))
+                '    <ofd:MultiMedia ID="%s" Type="Image" Format="PNG">'
+                '<ofd:MediaFile>%s</ofd:MediaFile></ofd:MultiMedia>\n'
+                % (mid, escape(fn)))
         parts.append('  </ofd:MultiMedias>\n')
     parts.append('</ofd:Res>\n')
     return "".join(parts)
@@ -181,6 +187,41 @@ def text_xml(oid: int, o: dict, font_id: int) -> str:
             % (" ".join(attrs), "".join(inner)))
 
 
+def _clips_xml(groups) -> str:
+    """把规格里的 clip（组列表，每组是若干坐标数组）写成 <ofd:Clips>。
+
+    规格格式：[[[x,y,x,y,...], ...], ...]
+      外层每个元素是一个 Clip（**组间取交集**），
+      内层是若干子路径（**组内取并集**）。
+    坐标相对对象 Boundary 左上角；每个 Area 的 Path 自带 Boundary（必选），
+    取其子路径的包围盒。
+    """
+    if not groups:
+        return ""
+    parts = ["<ofd:Clips>"]
+    for g in groups:
+        parts.append("<ofd:Clip>")
+        for pts in g:
+            if len(pts) < 6:
+                continue
+            xs = [pts[k] for k in range(0, len(pts), 2)]
+            ys = [pts[k] for k in range(1, len(pts), 2)]
+            bx, by = min(xs), min(ys)
+            bw = max(max(xs) - bx, 0.01)
+            bh = max(max(ys) - by, 0.01)
+            d = ["M %s %s" % (n(pts[0] - bx), n(pts[1] - by))]
+            for k in range(2, len(pts) - 1, 2):
+                d.append("L %s %s" % (n(pts[k] - bx), n(pts[k + 1] - by)))
+            d.append("C")
+            parts.append('<ofd:Area><ofd:Path Boundary="%s %s %s %s">'
+                         '<ofd:AbbreviatedData>%s</ofd:AbbreviatedData>'
+                         '</ofd:Path></ofd:Area>'
+                         % (n(bx), n(by), n(bw), n(bh), " ".join(d)))
+        parts.append("</ofd:Clip>")
+    parts.append("</ofd:Clips>")
+    return "".join(parts)
+
+
 def path_xml(oid: int, o: dict, boundary, d: str) -> str:
     attrs = ['ID="%d"' % oid,
              'Boundary="%s %s %s %s"' % tuple(n(v) for v in boundary)]
@@ -188,13 +229,23 @@ def path_xml(oid: int, o: dict, boundary, d: str) -> str:
     stroke = hex_rgb(o.get("stroke", "#000000"))
     lw = float(o.get("stroke_width", 0.25))
 
+    # 表35：PathObject 的 Fill 默认 false、Stroke 默认 true。
+    # 所以「有填充色」时必须**显式写 Fill="true"**，否则有颜色也不填充（会画成空白）。
     if fill is None:
         attrs.append('Fill="false"')
+    else:
+        attrs.append('Fill="true"')
     if stroke is None:
         attrs.append('Stroke="false"')
     else:
+        attrs.append('Stroke="true"')
         attrs.append('LineWidth="%s"' % n(lw))
     inner = []
+    # Clips 属于基类 CT_GraphicUnit 的 sequence，**必须排在派生类元素之前**
+    # （XSD 的 extension 语义：基类元素在前）。写到 AbbreviatedData 后面会被拒。
+    clip_xml = _clips_xml(o.get("clip"))
+    if clip_xml:
+        inner.append(clip_xml)
     if stroke is not None:
         inner.append(color_elem("StrokeColor", stroke))
     if fill is not None:
