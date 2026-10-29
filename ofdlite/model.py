@@ -1243,11 +1243,15 @@ class OFDObject(object):
         raw = self.element.get("Stroke")
         if raw is not None and str(raw).strip() != "":
             return X.bool_attr(raw, self.STROKE_DEFAULT)
+        # 只看标准里真实存在的三处依据：StrokeColor 子元素、LineWidth 属性、
+        # DrawParam 引用（绘制参数对象里可能带描边）。
+        # 早期这里还判断过一个 "StrokePattern" 元素——它不在标准里，
+        # 属臆造，已删除（后果无害但会误导后续维护）。
         if X.find(self.element, "StrokeColor") is not None:
             return True
-        if X.find(self.element, "StrokePattern") is not None:
-            return True
         if self.element.get("LineWidth") is not None:
+            return True
+        if self.element.get("DrawParam") is not None:
             return True
         return self.STROKE_DEFAULT
 
